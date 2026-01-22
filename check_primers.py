@@ -257,21 +257,12 @@ def check_single_sequence(fwd_seq, rev_seq, gene_seq, gene_name):
 
 def calculate_tm(seq):
     """
-    Calculate melting temperature using Wallace rule for short primers
-    and more accurate formula for longer primers
+    Calculate melting temperature using Wallace rule
+    Tm = 2(A+T) + 4(G+C)
+    This is a simple approximation suitable for primers 14-30 bp
     """
     seq = seq.upper()
-    length = len(seq)
-    
-    if length < 14:
-        # Wallace rule: Tm = 2(A+T) + 4(G+C)
-        tm = 2 * (seq.count('A') + seq.count('T')) + 4 * (seq.count('G') + seq.count('C'))
-    else:
-        # More accurate formula for primers 14+ bases
-        # Tm = 64.9 + 41 * (GC_count - 16.4) / length
-        gc_count = seq.count('G') + seq.count('C')
-        tm = 64.9 + 41 * (gc_count - 16.4) / length
-    
+    tm = 2 * (seq.count('A') + seq.count('T')) + 4 * (seq.count('G') + seq.count('C'))
     return tm
 
 def calculate_primer_stats(primer_seq):
