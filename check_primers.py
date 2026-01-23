@@ -137,6 +137,60 @@ def fetch_gene_sequence(gene_name, organism="Mus musculus"):
         print(f"❌ Error: {str(e)}")
         return None, None, [], None
 
+def fetch_chromosome_sequence(chrom, organism="Mus musculus"):
+    """
+    Fetch chromosome sequence from NCBI
+    Returns genomic_sequence, None, [], header (no mRNA for whole chromosomes)
+    """
+    print(f"  Fetching chromosome {chrom} sequence...", end=" ")
+    
+    search_url = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi"
+    fetch_url = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi"
+    
+    try:
+        # Search for chromosome
+        search_params = {
+            "db": "nucleotide",
+            "term": f"chromosome {chrom}[Title] AND {organism}[Organism] AND refseq[filter]",
+            "retmode": "json",
+            "retmax": 5
+        }
+        
+        search_response = requests.get(search_url, params=search_params, timeout=30)
+        search_data = search_response.json()
+        
+        if not search_data.get("esearchresult", {}).get("idlist"):
+            print("❌ Chromosome not found")
+            return None, None, [], None
+        
+        chrom_id = search_data["esearchresult"]["idlist"][0]
+        
+        # Fetch chromosome sequence (WARNING: chromosomes are HUGE, this might take a while)
+        print(f"⚠ Warning: Fetching entire chromosome (may be slow)...", end=" ")
+        fetch_params = {
+            "db": "nucleotide",
+            "id": chrom_id,
+            "rettype": "fasta",
+            "retmode": "text"
+        }
+        
+        fetch_response = requests.get(fetch_url, params=fetch_params, timeout=60)
+        fasta_text = fetch_response.text
+        
+        if fasta_text and '>' in fasta_text:
+            lines = fasta_text.strip().split('\n')
+            header = lines[0]
+            genomic_seq = ''.join(lines[1:]).upper()
+            print(f"✓ ({len(genomic_seq)} bp)")
+            return genomic_seq, None, [], header
+        else:
+            print("❌ Failed to fetch")
+            return None, None, [], None
+            
+    except Exception as e:
+        print(f"❌ Error: {str(e)}")
+        return None, None, [], None
+
 def find_primer_binding(primer_seq, gene_seq, primer_name="primer"):
     """
     Find where a primer binds in the gene sequence
@@ -327,13 +381,37 @@ def load_primers_from_excel(filepath):
     # Extract only rows with actual data (have sequences)
     primers_df = df[df['Sequence'].notna()].copy()
     
-    # Extract gene names from primer names (removing _Fwd and _Rev)
-    primers_df['Gene'] = primers_df['Oligo_Name'].str.replace('_Fwd', '').str.replace('_Rev', '').str.replace('_fwd', '').str.replace('_rev', '')
+    # Extract gene/locus names from primer names
+    # Handle multiple naming schemes:
+    # 1. Simple: "Gene_Fwd" / "Gene_Rev" → Gene
+    # 2. Complex: "Chr1_L_Flank_For" / "Chr1_L_Flank_Rev" → Chr1_L_Flank
+    # 3. Complex: "Locus_Region_For" / "Locus_Region_Rev" → Locus_Region
+    
+    def extract_gene_name(primer_name):
+        """Extract the gene/locus identifier by removing direction suffix"""
+        # Remove common direction indicators (case insensitive)
+        name = str(primer_name)
+        # Try removing from the end
+        for suffix in ['_For', '_Rev', '_Fwd', '_fwd', '_rev', '_for']:
+            if name.endswith(suffix):
+                return name[:-len(suffix)]
+        return name
+    
+    primers_df['Gene'] = primers_df['Oligo_Name'].apply(extract_gene_name)
+    
+    # Also extract the locus (first part before underscore) for chromosome queries
+    def extract_locus(gene_name):
+        """Extract locus (e.g., 'Chr1' from 'Chr1_L_Flank')"""
+        parts = str(gene_name).split('_')
+        return parts[0] if parts else gene_name
+    
+    primers_df['Locus'] = primers_df['Gene'].apply(extract_locus)
     
     print(f"✓ Found {len(primers_df)} primers")
-    print(f"✓ Found {primers_df['Gene'].nunique()} unique genes")
+    print(f"✓ Found {primers_df['Gene'].nunique()} unique primer pairs")
+    print(f"✓ Found {primers_df['Locus'].nunique()} unique loci")
     
-    return primers_df[['Oligo_Name', 'Sequence', 'Gene']]
+    return primers_df[['Oligo_Name', 'Sequence', 'Gene', 'Locus']]
 
 def validate_all_primers(primers_df, organism="Mus musculus"):
     """
@@ -356,34 +434,64 @@ def validate_all_primers(primers_df, organism="Mus musculus"):
         
         # Get forward and reverse primers for this gene
         gene_primers = primers_df[primers_df['Gene'] == gene]
-        fwd_primers = gene_primers[gene_primers['Oligo_Name'].str.contains('Fwd|fwd', na=False)]
+        fwd_primers = gene_primers[gene_primers['Oligo_Name'].str.contains('Fwd|fwd|For|for', na=False)]
         rev_primers = gene_primers[gene_primers['Oligo_Name'].str.contains('Rev|rev', na=False)]
         
         if len(fwd_primers) == 0 or len(rev_primers) == 0:
             print(f"  ⚠ Warning: Missing forward or reverse primer for {gene}")
+            
+            # Calculate stats for whichever primer we have
+            fwd_seq = fwd_primers.iloc[0]['Sequence'] if len(fwd_primers) > 0 else None
+            rev_seq = rev_primers.iloc[0]['Sequence'] if len(rev_primers) > 0 else None
+            
+            fwd_stats = calculate_primer_stats(fwd_seq) if fwd_seq else {'length': None, 'gc_content': None, 'tm': None}
+            rev_stats = calculate_primer_stats(rev_seq) if rev_seq else {'length': None, 'gc_content': None, 'tm': None}
+            
+            missing_type = 'forward' if len(fwd_primers) == 0 else 'reverse'
+            
             results.append({
                 'Gene': gene,
                 'Status': 'ERROR',
                 'Amplicon_Size_bp': None,
                 'Sequence_Type': 'N/A',
                 'Transcript_ID': 'N/A',
-                'Details': 'Missing forward or reverse primer',
-                'Fwd_Primer': None,
-                'Rev_Primer': None,
-                'Fwd_Length': None,
-                'Rev_Length': None,
-                'Fwd_GC%': None,
-                'Rev_GC%': None,
-                'Fwd_Tm_C': None,
-                'Rev_Tm_C': None
+                'Details': f'Missing {missing_type} primer',
+                'Fwd_Primer': fwd_seq,
+                'Rev_Primer': rev_seq,
+                'Fwd_Length': fwd_stats['length'],
+                'Rev_Length': rev_stats['length'],
+                'Fwd_GC%': fwd_stats['gc_content'],
+                'Rev_GC%': rev_stats['gc_content'],
+                'Fwd_Tm_C': fwd_stats['tm'],
+                'Rev_Tm_C': rev_stats['tm']
             })
             continue
         
         fwd_seq = fwd_primers.iloc[0]['Sequence']
         rev_seq = rev_primers.iloc[0]['Sequence']
         
+        # Calculate primer stats FIRST (always, even if NCBI fails)
+        fwd_stats = calculate_primer_stats(fwd_seq)
+        rev_stats = calculate_primer_stats(rev_seq)
+        
+        # Get the locus for this gene (e.g., 'Chr1' from 'Chr1_L_Flank')
+        locus = gene_primers.iloc[0]['Locus']
+        
+        # Check if this is a chromosome-based query
+        if locus.startswith('Chr') or locus.startswith('chr'):
+            # Extract chromosome number/letter from locus
+            chrom = locus.replace('Chr', '').replace('chr', '')
+            print(f"  Detected chromosome query: Chr{chrom} (region: {gene})")
+            # Use locus as cache key so all regions from same chromosome share sequence
+            if locus not in gene_sequences:
+                genomic_seq, cds_seq, mrna_isoforms, gene_header = fetch_chromosome_sequence(chrom, organism)
+                gene_sequences[locus] = (genomic_seq, cds_seq, mrna_isoforms, gene_header)
+                time.sleep(0.35)
+            else:
+                genomic_seq, cds_seq, mrna_isoforms, gene_header = gene_sequences[locus]
+                print(f"  Using cached chromosome sequence for Chr{chrom}")
         # Fetch gene sequence if not in cache
-        if gene not in gene_sequences:
+        elif gene not in gene_sequences:
             genomic_seq, cds_seq, mrna_isoforms, gene_header = fetch_gene_sequence(gene, organism)
             gene_sequences[gene] = (genomic_seq, cds_seq, mrna_isoforms, gene_header)
             time.sleep(0.35)  # Be nice to NCBI servers
@@ -393,9 +501,6 @@ def validate_all_primers(primers_df, organism="Mus musculus"):
         
         # Check the primer pair
         result = check_primer_pair(fwd_seq, rev_seq, genomic_seq, cds_seq, mrna_isoforms, gene)
-        
-        # Calculate primer stats
-        fwd_stats = calculate_primer_stats(fwd_seq)
         rev_stats = calculate_primer_stats(rev_seq)
         
         # Print result
