@@ -5,7 +5,9 @@ A Python script that validates PCR primer pairs by checking if they bind to the 
 ## Features
 
 - ✅ Validates primers against NCBI mouse gene sequences
+- ✅ **Checks multiple mRNA isoforms** to find the right transcript variant
 - ✅ Checks both mRNA (spliced) and genomic DNA (with introns)
+- ✅ **Reports which transcript/isoform matched** (e.g., NM_008601.4)
 - ✅ Calculates amplicon sizes
 - ✅ Validates amplicon size is 70-150 bp
 - ✅ Calculates primer statistics (length, GC%, Tm using Wallace rule)
@@ -93,6 +95,7 @@ The script generates an Excel file with the following information:
 | **Status** | PASS / WARN / FAIL / ERROR |
 | **Amplicon_Size_bp** | Predicted amplicon size |
 | **Sequence_Type** | mRNA / Genomic / mRNA (Genomic also checked) |
+| **Transcript_ID** | RefSeq accession (e.g., NM_008601.4) of matched isoform |
 | **Details** | Explanation of result |
 | **Fwd_Primer / Rev_Primer** | Primer sequences |
 | **Fwd_Length / Rev_Length** | Primer lengths |
@@ -115,11 +118,12 @@ The script generates an Excel file with the following information:
 ## How It Works
 
 1. Extracts primer pairs from Excel file
-2. Fetches both mRNA and genomic DNA sequences from NCBI for each gene
-3. Checks mRNA first (most primers are designed for RT-PCR)
-4. Falls back to genomic DNA if mRNA doesn't work
-5. Calculates amplicon sizes and validates 70-150 bp range
-6. Generates comprehensive Excel report
+2. Fetches **up to 5 mRNA isoforms** and genomic DNA sequences from NCBI for each gene
+3. Checks all mRNA isoforms first (primers might target specific variants)
+4. Falls back to genomic DNA if no mRNA isoform works
+5. **Reports which specific transcript/isoform matched** (e.g., NM_008601.4)
+6. Calculates amplicon sizes and validates 70-150 bp range
+7. Generates comprehensive Excel report
 
 ## Example Output
 

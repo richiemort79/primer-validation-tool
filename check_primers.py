@@ -40,34 +40,49 @@ def fetch_gene_sequence(gene_name, organism="Mus musculus"):
     
     try:
         # First, try to get mRNA/CDS sequence (this is what primers are usually designed for)
+        # Get multiple isoforms since primers might be designed for a specific variant
         mrna_search_params = {
             "db": "nucleotide",
             "term": f"{gene_name}[Gene] AND {organism}[Organism] AND refseq[filter] AND mrna[filter]",
             "retmode": "json",
-            "retmax": 5
+            "retmax": 10  # Get up to 10 isoforms to check
         }
         
         mrna_search_response = requests.get(search_url, params=mrna_search_params, timeout=10)
         mrna_search_data = mrna_search_response.json()
         
+        mrna_isoforms = []  # List of tuples: (accession, header, sequence)
         if mrna_search_data.get("esearchresult", {}).get("idlist"):
-            mrna_id = mrna_search_data["esearchresult"]["idlist"][0]
+            mrna_ids = mrna_search_data["esearchresult"]["idlist"]
             
-            # Fetch mRNA sequence (this is the spliced transcript without introns)
-            mrna_fetch_params = {
-                "db": "nucleotide",
-                "id": mrna_id,
-                "rettype": "fasta",
-                "retmode": "text"
-            }
+            # Fetch all isoforms
+            for mrna_id in mrna_ids[:5]:  # Limit to first 5 to avoid being too slow
+                mrna_fetch_params = {
+                    "db": "nucleotide",
+                    "id": mrna_id,
+                    "rettype": "fasta",
+                    "retmode": "text"
+                }
+                
+                mrna_fetch_response = requests.get(fetch_url, params=mrna_fetch_params, timeout=10)
+                mrna_fasta = mrna_fetch_response.text
+                
+                if mrna_fasta and '>' in mrna_fasta:
+                    mrna_lines = mrna_fasta.strip().split('\n')
+                    isoform_header = mrna_lines[0]
+                    if not header:
+                        header = isoform_header
+                    seq = ''.join(mrna_lines[1:]).upper()
+                    
+                    # Extract accession number from header (e.g., NM_008601.4)
+                    accession = isoform_header.split()[0].replace('>', '')
+                    mrna_isoforms.append((accession, isoform_header, seq))
+                
+                time.sleep(0.1)  # Small delay between fetches
             
-            mrna_fetch_response = requests.get(fetch_url, params=mrna_fetch_params, timeout=10)
-            mrna_fasta = mrna_fetch_response.text
-            
-            if mrna_fasta and '>' in mrna_fasta:
-                mrna_lines = mrna_fasta.strip().split('\n')
-                header = mrna_lines[0]
-                cds_seq = ''.join(mrna_lines[1:]).upper()
+            # Use the first isoform as primary CDS
+            if mrna_isoforms:
+                cds_seq = mrna_isoforms[0][2]  # Get sequence from first isoform
         
         # Now try to get genomic DNA sequence (with introns)
         genomic_search_params = {
@@ -103,20 +118,24 @@ def fetch_gene_sequence(gene_name, organism="Mus musculus"):
         # Print results
         if not genomic_seq and not cds_seq:
             print("❌ No sequences found")
-            return None, None, None
+            return None, None, [], None
         
         status_parts = []
         if cds_seq:
-            status_parts.append(f"mRNA: {len(cds_seq)} bp")
+            isoform_count = len(mrna_isoforms)
+            if isoform_count > 1:
+                status_parts.append(f"mRNA: {len(cds_seq)} bp ({isoform_count} isoforms)")
+            else:
+                status_parts.append(f"mRNA: {len(cds_seq)} bp")
         if genomic_seq:
             status_parts.append(f"Genomic: {len(genomic_seq)} bp")
         
         print(f"✓ ({', '.join(status_parts)})")
-        return genomic_seq, cds_seq, header
+        return genomic_seq, cds_seq, mrna_isoforms, header
         
     except Exception as e:
         print(f"❌ Error: {str(e)}")
-        return None, None, None
+        return None, None, [], None
 
 def find_primer_binding(primer_seq, gene_seq, primer_name="primer"):
     """
@@ -137,11 +156,11 @@ def find_primer_binding(primer_seq, gene_seq, primer_name="primer"):
     
     return positions
 
-def check_primer_pair(fwd_seq, rev_seq, genomic_seq, cds_seq, gene_name):
+def check_primer_pair(fwd_seq, rev_seq, genomic_seq, cds_seq, mrna_isoforms, gene_name):
     """
     Check if primer pair works and calculate amplicon size
-    Checks mRNA first (since primers are usually designed for mRNA), then genomic
-    Returns dict with results
+    Checks all mRNA isoforms first, then genomic
+    Returns dict with results including which isoform matched
     """
     result = {
         'gene': gene_name,
@@ -152,39 +171,49 @@ def check_primer_pair(fwd_seq, rev_seq, genomic_seq, cds_seq, gene_name):
         'amplicon_size': None,
         'status': 'FAIL',
         'details': '',
-        'sequence_type': None
+        'sequence_type': None,
+        'transcript_id': None
     }
     
     if genomic_seq is None and cds_seq is None:
         result['details'] = 'Gene sequence not found in NCBI'
         return result
     
-    # Try mRNA/CDS first (this is what most primers are designed for)
-    if cds_seq:
-        cds_result = check_single_sequence(fwd_seq, rev_seq, cds_seq, gene_name)
-        if cds_result['status'] in ['PASS', 'WARN']:
-            cds_result['sequence_type'] = 'mRNA'
-            return cds_result
+    # Try all mRNA isoforms (primers might be designed for a specific variant)
+    if mrna_isoforms:
+        for accession, isoform_header, isoform_seq in mrna_isoforms:
+            isoform_result = check_single_sequence(fwd_seq, rev_seq, isoform_seq, gene_name)
+            if isoform_result['status'] in ['PASS', 'WARN']:
+                isoform_result['sequence_type'] = 'mRNA'
+                isoform_result['transcript_id'] = accession
+                return isoform_result
+        
+        # If none of the isoforms worked, return result from first isoform for error reporting
+        first_result = check_single_sequence(fwd_seq, rev_seq, mrna_isoforms[0][2], gene_name)
+        first_result['sequence_type'] = f'mRNA (checked {len(mrna_isoforms)} isoforms)'
+        first_result['transcript_id'] = None
     
-    # If mRNA didn't work, try genomic DNA
+    # If mRNA isoforms didn't work, try genomic DNA
     if genomic_seq:
         genomic_result = check_single_sequence(fwd_seq, rev_seq, genomic_seq, gene_name)
         if genomic_result['status'] in ['PASS', 'WARN']:
             genomic_result['sequence_type'] = 'Genomic'
+            genomic_result['transcript_id'] = None
             return genomic_result
         
-        # If both failed, report genomic failure with note that mRNA was also tried
-        if cds_seq:
-            genomic_result['sequence_type'] = 'Genomic (mRNA also checked)'
+        # Both mRNA and genomic failed
+        if mrna_isoforms:
+            genomic_result['sequence_type'] = f'Genomic (also checked {len(mrna_isoforms)} mRNA isoforms)'
+            genomic_result['transcript_id'] = None
             return genomic_result
         else:
             genomic_result['sequence_type'] = 'Genomic'
+            genomic_result['transcript_id'] = None
             return genomic_result
     
-    # Only mRNA available and it failed
-    if cds_seq:
-        cds_result['sequence_type'] = 'mRNA'
-        return cds_result
+    # Only mRNA available and it failed - return the first_result we already created
+    if mrna_isoforms:
+        return first_result
     
     return result
 
@@ -337,6 +366,7 @@ def validate_all_primers(primers_df, organism="Mus musculus"):
                 'Status': 'ERROR',
                 'Amplicon_Size_bp': None,
                 'Sequence_Type': 'N/A',
+                'Transcript_ID': 'N/A',
                 'Details': 'Missing forward or reverse primer',
                 'Fwd_Primer': None,
                 'Rev_Primer': None,
@@ -354,15 +384,15 @@ def validate_all_primers(primers_df, organism="Mus musculus"):
         
         # Fetch gene sequence if not in cache
         if gene not in gene_sequences:
-            genomic_seq, cds_seq, gene_header = fetch_gene_sequence(gene, organism)
-            gene_sequences[gene] = (genomic_seq, cds_seq, gene_header)
+            genomic_seq, cds_seq, mrna_isoforms, gene_header = fetch_gene_sequence(gene, organism)
+            gene_sequences[gene] = (genomic_seq, cds_seq, mrna_isoforms, gene_header)
             time.sleep(0.35)  # Be nice to NCBI servers
         else:
-            genomic_seq, cds_seq, gene_header = gene_sequences[gene]
+            genomic_seq, cds_seq, mrna_isoforms, gene_header = gene_sequences[gene]
             print(f"  Using cached sequences for {gene}")
         
         # Check the primer pair
-        result = check_primer_pair(fwd_seq, rev_seq, genomic_seq, cds_seq, gene)
+        result = check_primer_pair(fwd_seq, rev_seq, genomic_seq, cds_seq, mrna_isoforms, gene)
         
         # Calculate primer stats
         fwd_stats = calculate_primer_stats(fwd_seq)
@@ -386,6 +416,7 @@ def validate_all_primers(primers_df, organism="Mus musculus"):
             'Status': result['status'],
             'Amplicon_Size_bp': result['amplicon_size'],
             'Sequence_Type': result.get('sequence_type', 'N/A'),
+            'Transcript_ID': result.get('transcript_id', 'N/A'),
             'Details': details_with_note,
             'Fwd_Primer': fwd_seq,
             'Rev_Primer': rev_seq,
