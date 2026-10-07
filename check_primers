@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+# Run check_primers.py in the tool's environment, setting it up first if it
+# is missing or requirements.txt has changed since it was installed.
+#
+#   ./check_primers primers.xlsx [options]     (see ./check_primers --help)
+set -euo pipefail
+
+REPO_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+VENV="${PRIMER_TOOL_VENV:-$HOME/.venvs/primer_validation_tool}"
+
+if [ ! -x "$VENV/bin/python" ] ||
+   ! cmp -s "$REPO_DIR/requirements.txt" "$VENV/.primer_tool_requirements"; then
+    "$REPO_DIR/setup.sh" >&2
+fi
+
+exec "$VENV/bin/python" "$REPO_DIR/check_primers.py" "$@"

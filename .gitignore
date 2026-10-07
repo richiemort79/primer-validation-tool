@@ -1,8 +1,10 @@
 # Virtual Environment
 venv/
+.venv/
 env/
 ENV/
 *.venv
+primer_env/
 
 # Python
 __pycache__/
@@ -36,10 +38,17 @@ wheels/
 *.swo
 *~
 
-# Output files
-*_validation_results.xlsx
+# Output files / primer sheets
+*_validation_results.*
 *.xlsx
 !DNA_tubes_Template_EXAMPLE.xlsx
+
+# Test / tool caches (genome downloads normally live in ~/.cache/primer_validation_tool)
+.pytest_cache/
+.cache/
+*.fa.gz
+*.part
+*.chrom.sizes
 
 # OS
 .DS_Store
@@ -47,5 +56,4 @@ Thumbs.db
 
 # Logs
 *.log
-primer_env/
 .~lock.*

@@ -1,5 +1,29 @@
 # Changelog
 
+## Version 2.0.0 (2026-10-07)
+
+### Bug fixes
+- Gene names starting with "Chr" (Chrm1, Chrna7, Chrd...) were treated as chromosomes; only exact tokens (Chr1, ChrX, ChrMT) count now
+- Fwd/Rev detection matched anywhere in the name, so `Rev3l_Fwd` counted as both; it now requires a direction suffix (case-insensitive, with optional pair number: `_F1`/`_R1`)
+- Chromosome loci are searched on both strands; the whole-chromosome efetch (which timed out) is replaced by a cached UCSC download, and `chromosome 1[Title]` no longer matches chr10-19
+- Genomic sequence now comes from the gene's own coordinates in NCBI Gene (not the first genomic search hit, which could be the wrong record)
+- Transcripts come from NCBI Gene links, so only that gene's RefSeq RNAs are checked, and all of them (not 5 of 10)
+- NCBI requests are rate-limited and retried; network failures are reported as ERROR rather than "not found"
+- Input header row is detected instead of assumed; sheets with fewer than 10 columns no longer crash; CSV supported
+
+### New
+- Mismatch tolerance (`--max-mismatches`, default 1, 3' end must match) and degenerate IUPAC bases
+- Reports every product: multiple products, single-primer products and swapped Fwd/Rev are flagged
+- Genomic DNA product size per pair (shows whether the primers span an intron)
+- Which/how many transcripts each pair amplifies
+- Products inferred between unpartnered locus primers (e.g. Chr1_L_Flank + Chr1_L_Int)
+- `--genome-check`: genome-wide off-target product search
+- Nearest-neighbour Tm (Primer3) replaces the Wallace rule
+- Output has Pairs, Primers and Settings sheets; size window, product limit, flank etc. are options
+- NCBI results and genome files cached in ~/.cache/primer_validation_tool
+- Offline unit tests (`pytest tests`)
+- `setup.sh` creates the environment outside the repo (~/.venvs); `./check_primers` wrapper runs setup automatically when needed
+
 ## Version 1.1.0 (2025-01-22)
 
 ### New Features

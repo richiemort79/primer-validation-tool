@@ -1,649 +1,1190 @@
 #!/usr/bin/env python3
 """
-Primer Validation Script for Mouse Genes
-Checks if primers target the correct genes and generate 70-150bp amplicons
+Primer Validation Tool
+
+Checks PCR primer pairs in silico:
+  * gene-targeted pairs (e.g. Mitf_Fwd / Mitf_Rev) are tested against every
+    RefSeq transcript of the gene and against the gene's genomic region (NCBI);
+  * chromosome-locus primers (e.g. Chr1_L_Flank) are located on that chromosome
+    (UCSC genome download, both strands) and the products they form are reported;
+  * optionally (--genome-check) every primer is searched genome-wide to find
+    off-target products.
 
 Usage:
     python check_primers.py                          # Interactive file selection
-    python check_primers.py input_file.xlsx          # Specify file directly
-    python check_primers.py input_file.xlsx -o output.xlsx  # Custom output name
+    python check_primers.py primers.xlsx             # Specify file directly
+    python check_primers.py primers.xlsx -o out.xlsx # Custom output name
+    python check_primers.py primers.xlsx --genome-check
 """
+
+import argparse
+import gzip
+import json
+import os
+import re
+import sys
+import time
+from bisect import bisect_left
+from dataclasses import dataclass, field, replace
+from datetime import datetime
+from pathlib import Path
 
 import pandas as pd
 import requests
-import time
-import re
-import sys
-import os
-import argparse
+
+try:
+    import primer3
+except ImportError:  # Tm is reported as blank if primer3-py is missing
+    primer3 = None
+
+try:
+    import ahocorasick
+except ImportError:  # only needed for genome searches
+    ahocorasick = None
+
+
+# --------------------------------------------------------------------------
+# Constants
+# --------------------------------------------------------------------------
+
+IUPAC = {
+    'A': 'A', 'C': 'C', 'G': 'G', 'T': 'T',
+    'R': 'AG', 'Y': 'CT', 'S': 'CG', 'W': 'AT', 'K': 'GT', 'M': 'AC',
+    'B': 'CGT', 'D': 'AGT', 'H': 'ACT', 'V': 'ACG', 'N': 'ACGT',
+}
+COMPLEMENT = str.maketrans('ACGTRYSWKMBDHVN', 'TGCAYRSWMKVHDBN')
+
+# Organism -> UCSC assembly. These match the assemblies NCBI Gene currently
+# annotates, so NCBI gene coordinates and UCSC chromosome positions agree.
+UCSC_DBS = {
+    'mus musculus': 'mm39',
+    'rattus norvegicus': 'rn7',
+    'homo sapiens': 'hg38',
+    'danio rerio': 'danRer11',
+    'gallus gallus': 'galGal6',
+    'drosophila melanogaster': 'dm6',
+}
+UCSC_DOWNLOAD = 'https://hgdownload.soe.ucsc.edu/goldenPath'
+
+# "Gene_Fwd", "Gene-rev", "Gene_F1", "Gene_Reverse2" ... (case-insensitive).
+# A separator is required so gene names ending in f/r are not split.
+DIRECTION_RE = re.compile(
+    r'^(?P<base>.+?)[_\-\s.](?P<dir>fwd|for|forward|f|rev|reverse|r)(?P<num>\d*)$',
+    re.IGNORECASE)
+# Only an exact chromosome token counts, so genes such as Chrm1, Chrna7 or
+# Chrd are still treated as genes.
+CHROM_RE = re.compile(r'^chr(?P<chrom>\d+|X|Y|M|MT)$', re.IGNORECASE)
+
+STATUS_ORDER = {'FAIL': 0, 'ERROR': 1, 'WARN': 2, 'PASS': 3, 'INFERRED': 4}
+
+DEFAULT_CACHE = Path(os.environ.get(
+    'PRIMER_TOOL_CACHE', Path.home() / '.cache' / 'primer_validation_tool'))
+
+
+# --------------------------------------------------------------------------
+# Sequence utilities
+# --------------------------------------------------------------------------
 
 def reverse_complement(seq):
-    """Return reverse complement of a DNA sequence"""
-    complement = {'A': 'T', 'T': 'A', 'G': 'C', 'C': 'G',
-                  'a': 't', 't': 'a', 'g': 'c', 'c': 'g'}
-    return ''.join(complement.get(base, base) for base in reversed(seq))
+    """Return reverse complement of a DNA sequence (IUPAC-aware)"""
+    return seq.upper().translate(COMPLEMENT)[::-1]
 
-def fetch_gene_sequence(gene_name, organism="Mus musculus"):
-    """
-    Fetch gene sequence from NCBI for a given gene name and organism
-    Returns genomic_sequence, cds_sequence, header
-    """
-    print(f"  Fetching sequences for {gene_name}...", end=" ")
-    
-    # Search for the gene
-    search_url = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi"
-    fetch_url = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi"
-    
-    genomic_seq = None
-    cds_seq = None
-    header = None
-    
-    try:
-        # First, try to get mRNA/CDS sequence (this is what primers are usually designed for)
-        # Get multiple isoforms since primers might be designed for a specific variant
-        mrna_search_params = {
-            "db": "nucleotide",
-            "term": f"{gene_name}[Gene] AND {organism}[Organism] AND refseq[filter] AND mrna[filter]",
-            "retmode": "json",
-            "retmax": 10  # Get up to 10 isoforms to check
-        }
-        
-        mrna_search_response = requests.get(search_url, params=mrna_search_params, timeout=10)
-        mrna_search_data = mrna_search_response.json()
-        
-        mrna_isoforms = []  # List of tuples: (accession, header, sequence)
-        if mrna_search_data.get("esearchresult", {}).get("idlist"):
-            mrna_ids = mrna_search_data["esearchresult"]["idlist"]
-            
-            # Fetch all isoforms
-            for mrna_id in mrna_ids[:5]:  # Limit to first 5 to avoid being too slow
-                mrna_fetch_params = {
-                    "db": "nucleotide",
-                    "id": mrna_id,
-                    "rettype": "fasta",
-                    "retmode": "text"
-                }
-                
-                mrna_fetch_response = requests.get(fetch_url, params=mrna_fetch_params, timeout=10)
-                mrna_fasta = mrna_fetch_response.text
-                
-                if mrna_fasta and '>' in mrna_fasta:
-                    mrna_lines = mrna_fasta.strip().split('\n')
-                    isoform_header = mrna_lines[0]
-                    if not header:
-                        header = isoform_header
-                    seq = ''.join(mrna_lines[1:]).upper()
-                    
-                    # Extract accession number from header (e.g., NM_008601.4)
-                    accession = isoform_header.split()[0].replace('>', '')
-                    mrna_isoforms.append((accession, isoform_header, seq))
-                
-                time.sleep(0.1)  # Small delay between fetches
-            
-            # Use the first isoform as primary CDS
-            if mrna_isoforms:
-                cds_seq = mrna_isoforms[0][2]  # Get sequence from first isoform
-        
-        # Now try to get genomic DNA sequence (with introns)
-        genomic_search_params = {
-            "db": "nucleotide",
-            "term": f"{gene_name}[Gene] AND {organism}[Organism] AND refseq[filter] AND genomic[filter]",
-            "retmode": "json",
-            "retmax": 5
-        }
-        
-        genomic_search_response = requests.get(search_url, params=genomic_search_params, timeout=10)
-        genomic_search_data = genomic_search_response.json()
-        
-        if genomic_search_data.get("esearchresult", {}).get("idlist"):
-            genomic_id = genomic_search_data["esearchresult"]["idlist"][0]
-            
-            # Fetch genomic sequence
-            genomic_fetch_params = {
-                "db": "nucleotide",
-                "id": genomic_id,
-                "rettype": "fasta",
-                "retmode": "text"
-            }
-            
-            genomic_fetch_response = requests.get(fetch_url, params=genomic_fetch_params, timeout=10)
-            genomic_fasta = genomic_fetch_response.text
-            
-            if genomic_fasta and '>' in genomic_fasta:
-                genomic_lines = genomic_fasta.strip().split('\n')
-                if not header:  # Use genomic header if we didn't get mRNA
-                    header = genomic_lines[0]
-                genomic_seq = ''.join(genomic_lines[1:]).upper()
-        
-        # Print results
-        if not genomic_seq and not cds_seq:
-            print("❌ No sequences found")
-            return None, None, [], None
-        
-        status_parts = []
-        if cds_seq:
-            isoform_count = len(mrna_isoforms)
-            if isoform_count > 1:
-                status_parts.append(f"mRNA: {len(cds_seq)} bp ({isoform_count} isoforms)")
-            else:
-                status_parts.append(f"mRNA: {len(cds_seq)} bp")
-        if genomic_seq:
-            status_parts.append(f"Genomic: {len(genomic_seq)} bp")
-        
-        print(f"✓ ({', '.join(status_parts)})")
-        return genomic_seq, cds_seq, mrna_isoforms, header
-        
-    except Exception as e:
-        print(f"❌ Error: {str(e)}")
-        return None, None, [], None
 
-def fetch_chromosome_sequence(chrom, organism="Mus musculus"):
-    """
-    Fetch chromosome sequence from NCBI
-    Returns genomic_sequence, None, [], header (no mRNA for whole chromosomes)
-    """
-    print(f"  Fetching chromosome {chrom} sequence...", end=" ")
-    
-    search_url = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi"
-    fetch_url = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi"
-    
-    try:
-        # Search for chromosome
-        search_params = {
-            "db": "nucleotide",
-            "term": f"chromosome {chrom}[Title] AND {organism}[Organism] AND refseq[filter]",
-            "retmode": "json",
-            "retmax": 5
-        }
-        
-        search_response = requests.get(search_url, params=search_params, timeout=30)
-        search_data = search_response.json()
-        
-        if not search_data.get("esearchresult", {}).get("idlist"):
-            print("❌ Chromosome not found")
-            return None, None, [], None
-        
-        chrom_id = search_data["esearchresult"]["idlist"][0]
-        
-        # Fetch chromosome sequence (WARNING: chromosomes are HUGE, this might take a while)
-        print(f"⚠ Warning: Fetching entire chromosome (may be slow)...", end=" ")
-        fetch_params = {
-            "db": "nucleotide",
-            "id": chrom_id,
-            "rettype": "fasta",
-            "retmode": "text"
-        }
-        
-        fetch_response = requests.get(fetch_url, params=fetch_params, timeout=60)
-        fasta_text = fetch_response.text
-        
-        if fasta_text and '>' in fasta_text:
-            lines = fasta_text.strip().split('\n')
-            header = lines[0]
-            genomic_seq = ''.join(lines[1:]).upper()
-            print(f"✓ ({len(genomic_seq)} bp)")
-            return genomic_seq, None, [], header
-        else:
-            print("❌ Failed to fetch")
-            return None, None, [], None
-            
-    except Exception as e:
-        print(f"❌ Error: {str(e)}")
-        return None, None, [], None
+def clean_sequence(raw):
+    """Strip whitespace and inline modification codes (/5Phos/, [Phos]); RNA U -> T"""
+    seq = re.sub(r'/[^/]*/', '', str(raw))
+    seq = re.sub(r'\[[^\]]*\]', '', seq)
+    return re.sub(r'\s+', '', seq).upper().replace('U', 'T')
 
-def find_primer_binding(primer_seq, gene_seq, primer_name="primer"):
-    """
-    Find where a primer binds in the gene sequence
-    Returns list of binding positions
-    """
-    positions = []
-    primer_upper = primer_seq.upper()
-    
-    # Search for exact matches
-    start = 0
-    while True:
-        pos = gene_seq.find(primer_upper, start)
-        if pos == -1:
-            break
-        positions.append(pos)
-        start = pos + 1
-    
-    return positions
 
-def check_primer_pair(fwd_seq, rev_seq, genomic_seq, cds_seq, mrna_isoforms, gene_name):
-    """
-    Check if primer pair works and calculate amplicon size
-    Checks all mRNA isoforms first, then genomic
-    Returns dict with results including which isoform matched
-    """
-    result = {
-        'gene': gene_name,
-        'fwd_primer': fwd_seq,
-        'rev_primer': rev_seq,
-        'fwd_binds': False,
-        'rev_binds': False,
-        'amplicon_size': None,
-        'status': 'FAIL',
-        'details': '',
-        'sequence_type': None,
-        'transcript_id': None
-    }
-    
-    if genomic_seq is None and cds_seq is None:
-        result['details'] = 'Gene sequence not found in NCBI'
-        return result
-    
-    # Try all mRNA isoforms (primers might be designed for a specific variant)
-    if mrna_isoforms:
-        for accession, isoform_header, isoform_seq in mrna_isoforms:
-            isoform_result = check_single_sequence(fwd_seq, rev_seq, isoform_seq, gene_name)
-            if isoform_result['status'] in ['PASS', 'WARN']:
-                isoform_result['sequence_type'] = 'mRNA'
-                isoform_result['transcript_id'] = accession
-                return isoform_result
-        
-        # If none of the isoforms worked, return result from first isoform for error reporting
-        first_result = check_single_sequence(fwd_seq, rev_seq, mrna_isoforms[0][2], gene_name)
-        first_result['sequence_type'] = f'mRNA (checked {len(mrna_isoforms)} isoforms)'
-        first_result['transcript_id'] = None
-    
-    # If mRNA isoforms didn't work, try genomic DNA
-    if genomic_seq:
-        genomic_result = check_single_sequence(fwd_seq, rev_seq, genomic_seq, gene_name)
-        if genomic_result['status'] in ['PASS', 'WARN']:
-            genomic_result['sequence_type'] = 'Genomic'
-            genomic_result['transcript_id'] = None
-            return genomic_result
-        
-        # Both mRNA and genomic failed
-        if mrna_isoforms:
-            genomic_result['sequence_type'] = f'Genomic (also checked {len(mrna_isoforms)} mRNA isoforms)'
-            genomic_result['transcript_id'] = None
-            return genomic_result
-        else:
-            genomic_result['sequence_type'] = 'Genomic'
-            genomic_result['transcript_id'] = None
-            return genomic_result
-    
-    # Only mRNA available and it failed - return the first_result we already created
-    if mrna_isoforms:
-        return first_result
-    
-    return result
+def invalid_bases(seq):
+    return sorted(set(seq) - set(IUPAC))
 
-def check_single_sequence(fwd_seq, rev_seq, gene_seq, gene_name):
-    """
-    Check if primer pair works on a single sequence
-    Returns dict with results
-    """
-    result = {
-        'gene': gene_name,
-        'fwd_primer': fwd_seq,
-        'rev_primer': rev_seq,
-        'fwd_binds': False,
-        'rev_binds': False,
-        'amplicon_size': None,
-        'status': 'FAIL',
-        'details': ''
-    }
-    
-    if gene_seq is None:
-        result['details'] = 'Sequence not available'
-        return result
-    
-    # Find forward primer binding sites
-    fwd_positions = find_primer_binding(fwd_seq, gene_seq)
-    
-    # Find reverse primer binding sites (need to check reverse complement)
-    rev_comp = reverse_complement(rev_seq)
-    rev_positions = find_primer_binding(rev_comp, gene_seq)
-    
-    result['fwd_binds'] = len(fwd_positions) > 0
-    result['rev_binds'] = len(rev_positions) > 0
-    
-    if not result['fwd_binds']:
-        result['details'] = 'Forward primer does not bind to gene'
-        return result
-    
-    if not result['rev_binds']:
-        result['details'] = 'Reverse primer does not bind to gene'
-        return result
-    
-    # Calculate all possible amplicon sizes
-    amplicon_sizes = []
-    for fwd_pos in fwd_positions:
-        for rev_pos in rev_positions:
-            if rev_pos > fwd_pos:  # Reverse primer must be downstream
-                # Amplicon size is from start of forward primer to end of reverse primer
-                size = (rev_pos + len(rev_comp)) - fwd_pos
-                amplicon_sizes.append(size)
-    
-    if not amplicon_sizes:
-        result['details'] = 'Primers bind but in wrong orientation (no amplicon)'
-        return result
-    
-    # Use the smallest amplicon size (most likely product)
-    result['amplicon_size'] = min(amplicon_sizes)
-    
-    # Check if amplicon is in the target range (70-150 bp)
-    if 70 <= result['amplicon_size'] <= 150:
-        result['status'] = 'PASS'
-        result['details'] = f'Amplicon size: {result["amplicon_size"]} bp ✓'
-    else:
-        result['status'] = 'WARN'
-        if result['amplicon_size'] < 70:
-            result['details'] = f'Amplicon too short: {result["amplicon_size"]} bp (need 70-150 bp)'
-        else:
-            result['details'] = f'Amplicon too long: {result["amplicon_size"]} bp (need 70-150 bp)'
-    
-    return result
 
 def calculate_tm(seq):
     """
-    Calculate melting temperature using Wallace rule
-    Tm = 2(A+T) + 4(G+C)
-    This is a simple approximation suitable for primers 14-30 bp
+    Nearest-neighbour Tm (SantaLucia 1998) via Primer3, using Primer3's default
+    conditions: 50 mM monovalent, 1.5 mM Mg2+, 0.6 mM dNTPs, 50 nM oligo.
+    Returns None for degenerate primers or if primer3-py is not installed.
     """
-    seq = seq.upper()
-    tm = 2 * (seq.count('A') + seq.count('T')) + 4 * (seq.count('G') + seq.count('C'))
-    return tm
+    if primer3 is None or not seq or set(seq) - set('ACGT'):
+        return None
+    return round(primer3.calc_tm(seq), 1)
 
-def calculate_primer_stats(primer_seq):
-    """Calculate GC content and Tm for a primer"""
-    gc_count = primer_seq.upper().count('G') + primer_seq.upper().count('C')
-    gc_content = (gc_count / len(primer_seq)) * 100
-    
-    try:
-        tm = calculate_tm(primer_seq)
-    except:
-        tm = None
-    
+
+def calculate_primer_stats(seq):
+    """Length, GC content and Tm for a primer"""
+    if not seq:
+        return {'length': None, 'gc_content': None, 'tm': None}
+    gc = seq.count('G') + seq.count('C') + seq.count('S')
     return {
-        'length': len(primer_seq),
-        'gc_content': round(gc_content, 1),
-        'tm': round(tm, 1) if tm else None
+        'length': len(seq),
+        'gc_content': round(gc / len(seq) * 100, 1),
+        'tm': calculate_tm(seq),
     }
 
-def load_primers_from_excel(filepath):
+
+@dataclass
+class Site:
+    """A primer binding site. strand '+' = primer sequence reads left-to-right
+    in the target (extends rightwards); '-' = its reverse complement does."""
+    start: int
+    end: int
+    strand: str
+    mismatches: int
+    primer: object = None
+    chrom: str = None
+
+
+@dataclass
+class Product:
+    left: Site   # '+' site
+    right: Site  # '-' site
+    size: int
+
+    @property
+    def chrom(self):
+        return self.left.chrom
+
+    def location(self):
+        prefix = f'{self.chrom}:' if self.chrom else ''
+        return f'{prefix}{self.left.start + 1}-{self.right.end}'
+
+
+def _expand_degenerate(pattern, cap=64):
+    """All concrete ACGT sequences a degenerate pattern stands for (None if > cap)"""
+    combos = ['']
+    for base in pattern:
+        combos = [c + b for c in combos for b in IUPAC[base]]
+        if len(combos) > cap:
+            return None
+    return combos
+
+
+def _count_mismatches(allowed, target, limit):
+    mm = 0
+    for ok, base in zip(allowed, target):
+        if base not in ok:
+            mm += 1
+            if mm > limit:
+                break
+    return mm
+
+
+def _find_anchor(anchor, seq):
+    """Start positions of an (optionally degenerate) anchor in seq, overlapping"""
+    if not set(anchor) - set('ACGT'):
+        pos = seq.find(anchor)
+        while pos != -1:
+            yield pos
+            pos = seq.find(anchor, pos + 1)
+    else:
+        pattern = ''.join(f'[{IUPAC[b]}]' for b in anchor)
+        for m in re.finditer(f'(?=({pattern}))', seq):
+            yield m.start()
+
+
+def find_primer_sites(primer, seq, max_mismatches=0, exact_3prime=5):
     """
-    Load primers from Excel file in the IDT template format
-    Returns DataFrame with primer information
+    Find where a primer anneals in seq, on both strands.
+    The 3'-most `exact_3prime` bases must match exactly (a 3' mismatch blocks
+    extension); up to `max_mismatches` are tolerated elsewhere. Degenerate
+    bases in the primer match any base they stand for.
+    """
+    L = len(primer)
+    k = min(exact_3prime, L)
+    sites = {}
+    for strand, probe in (('+', primer), ('-', reverse_complement(primer))):
+        allowed = [IUPAC[b] for b in probe]
+        # The primer's 3' end is at the right of the probe on '+', left on '-'
+        offset = L - k if strand == '+' else 0
+        anchor = probe[offset:offset + k]
+        for pos in _find_anchor(anchor, seq):
+            start = pos - offset
+            if start < 0 or start + L > len(seq):
+                continue
+            mm = _count_mismatches(allowed, seq[start:start + L], max_mismatches)
+            if mm <= max_mismatches:
+                sites[(start, strand)] = Site(start, start + L, strand, mm)
+    return sorted(sites.values(), key=lambda s: (s.start, s.strand))
+
+
+def find_products(sites, max_size):
+    """
+    All PCR products formed by a set of sites on one sequence: a '+' site
+    followed, within max_size, by a '-' site. Sites may come from any primer,
+    so primer-pair, self-primed and cross-pair products are all found.
+    """
+    plus = sorted((s for s in sites if s.strand == '+'), key=lambda s: s.start)
+    minus = sorted((s for s in sites if s.strand == '-'), key=lambda s: s.start)
+    minus_starts = [s.start for s in minus]
+    products = []
+    for a in plus:
+        i = bisect_left(minus_starts, a.start)
+        while i < len(minus) and minus[i].start < a.start + max_size:
+            b = minus[i]
+            size = b.end - a.start
+            if b.end > a.end and size <= max_size:
+                products.append(Product(a, b, size))
+            i += 1
+    return products
+
+
+@dataclass
+class SequenceResult:
+    fwd_sites: list
+    rev_sites: list
+    products: list   # fwd/rev products (either orientation)
+    extra: list      # products primed by a single primer (fwd+fwd or rev+rev)
+
+
+def evaluate_on_sequence(fwd, rev, seq, max_mismatches, exact_3prime, max_size):
+    """Locate both primers on seq and work out the products they form"""
+    f_sites = find_primer_sites(fwd, seq, max_mismatches, exact_3prime)
+    r_sites = find_primer_sites(rev, seq, max_mismatches, exact_3prime)
+    for s in f_sites:
+        s.primer = 'F'
+    for s in r_sites:
+        s.primer = 'R'
+    products, extra = [], []
+    for p in find_products(f_sites + r_sites, max_size):
+        (products if p.left.primer != p.right.primer else extra).append(p)
+    products.sort(key=lambda p: p.size)
+    return SequenceResult(f_sites, r_sites, products, extra)
+
+
+def product_mismatches(product):
+    """(fwd mismatches, rev mismatches) for a fwd/rev product"""
+    if product.left.primer == 'F':
+        return product.left.mismatches, product.right.mismatches
+    return product.right.mismatches, product.left.mismatches
+
+
+# --------------------------------------------------------------------------
+# Input
+# --------------------------------------------------------------------------
+
+@dataclass
+class Primer:
+    name: str
+    seq: str
+    row: int
+    base: str = ''
+    direction: str = None   # 'F', 'R' or None
+    pair_num: str = ''
+    chrom: str = None       # e.g. 'chr1' for Chr1_* locus primers
+    stats: dict = field(default_factory=dict)
+    error: str = None
+    paired_with: list = field(default_factory=list)
+    binding: str = ''
+
+    @property
+    def pair_key(self):
+        return (self.base.lower(), self.pair_num)
+
+    @property
+    def label(self):
+        return self.base + self.pair_num
+
+
+def parse_primer_name(name):
+    """
+    Split a primer name into (base, direction, pair number).
+    'Gapdh_Fwd' -> ('Gapdh', 'F', ''); 'Gapdh_R2' -> ('Gapdh', 'R', '2');
+    'Chr1_L_Flank' -> ('Chr1_L_Flank', None, '')
+    """
+    name = str(name).strip()
+    m = DIRECTION_RE.match(name)
+    if not m:
+        return name, None, ''
+    direction = 'F' if m['dir'].lower().startswith('f') else 'R'
+    return m['base'], direction, m['num']
+
+
+def chromosome_of(base):
+    """'Chr1_L_Flank' -> 'chr1'; 'ChrX' -> 'chrX'; 'Chrm1' -> None"""
+    m = CHROM_RE.match(str(base).split('_')[0])
+    if not m:
+        return None
+    chrom = m['chrom'].upper()
+    return 'chr' + ('M' if chrom == 'MT' else chrom)
+
+
+def gene_symbol_candidates(base):
+    """Symbols to try in NCBI Gene: the full base name, then its first token"""
+    candidates = [base]
+    first = base.split('_')[0]
+    if first and first != base:
+        candidates.append(first)
+    return candidates
+
+
+def _find_columns(raw):
+    """Locate the header row and the name/sequence columns"""
+    for i in range(min(30, len(raw))):
+        cells = [str(c).lower() if pd.notna(c) else '' for c in raw.iloc[i]]
+        seq_col = next((j for j, c in enumerate(cells) if 'sequence' in c), None)
+        name_col = next((j for j, c in enumerate(cells) if 'name' in c), None)
+        if seq_col is not None and name_col is not None:
+            return i, name_col, seq_col
+    return None, 0, 2  # no header found: IDT layout, column A / column C
+
+
+def load_primers(filepath, sheet=None):
+    """
+    Load primers from an Excel (IDT/Sigma order template) or CSV file.
+    The header row is found by looking for 'Name' and 'Sequence' columns;
+    without one, column A is taken as the name and column C as the sequence.
     """
     print(f"\nLoading primers from: {filepath}")
-    
-    # Read the Excel file starting from row 5 (header row)
-    df = pd.read_excel(filepath, header=4)
-    
-    # Clean column names
-    df.columns = ['Oligo_Name', 'Mod_5', 'Sequence', 'Mod_3', 'Scale', 'Purification', 
-                  'Format', 'Concentration', 'Number_Tubes', 'Notes'] + [f'Extra_{i}' for i in range(len(df.columns)-10)]
-    
-    # Extract only rows with actual data (have sequences)
-    primers_df = df[df['Sequence'].notna()].copy()
-    
-    # Extract gene/locus names from primer names
-    # Handle multiple naming schemes:
-    # 1. Simple: "Gene_Fwd" / "Gene_Rev" → Gene
-    # 2. Complex: "Chr1_L_Flank_For" / "Chr1_L_Flank_Rev" → Chr1_L_Flank
-    # 3. Complex: "Locus_Region_For" / "Locus_Region_Rev" → Locus_Region
-    
-    def extract_gene_name(primer_name):
-        """Extract the gene/locus identifier by removing direction suffix"""
-        # Remove common direction indicators (case insensitive)
-        name = str(primer_name)
-        # Try removing from the end
-        for suffix in ['_For', '_Rev', '_Fwd', '_fwd', '_rev', '_for']:
-            if name.endswith(suffix):
-                return name[:-len(suffix)]
-        return name
-    
-    primers_df['Gene'] = primers_df['Oligo_Name'].apply(extract_gene_name)
-    
-    # Also extract the locus (first part before underscore) for chromosome queries
-    def extract_locus(gene_name):
-        """Extract locus (e.g., 'Chr1' from 'Chr1_L_Flank')"""
-        parts = str(gene_name).split('_')
-        return parts[0] if parts else gene_name
-    
-    primers_df['Locus'] = primers_df['Gene'].apply(extract_locus)
-    
-    print(f"✓ Found {len(primers_df)} primers")
-    print(f"✓ Found {primers_df['Gene'].nunique()} unique primer pairs")
-    print(f"✓ Found {primers_df['Locus'].nunique()} unique loci")
-    
-    return primers_df[['Oligo_Name', 'Sequence', 'Gene', 'Locus']]
+    if str(filepath).lower().endswith('.csv'):
+        raw = pd.read_csv(filepath, header=None, dtype=str)
+    else:
+        raw = pd.read_excel(filepath, sheet_name=sheet if sheet is not None else 0,
+                            header=None, dtype=str)
 
-def validate_all_primers(primers_df, organism="Mus musculus"):
-    """
-    Validate all primer pairs in the DataFrame
-    Returns results DataFrame
-    """
-    # Organize primers into pairs
-    genes = primers_df['Gene'].unique()
-    results = []
-    
-    print(f"\n{'='*70}")
-    print(f"Validating {len(genes)} primer pairs against {organism} genes")
-    print(f"{'='*70}\n")
-    
-    # Cache for gene sequences
-    gene_sequences = {}
-    
-    for i, gene in enumerate(genes, 1):
-        print(f"[{i}/{len(genes)}] Checking {gene}...")
-        
-        # Get forward and reverse primers for this gene
-        gene_primers = primers_df[primers_df['Gene'] == gene]
-        fwd_primers = gene_primers[gene_primers['Oligo_Name'].str.contains('Fwd|fwd|For|for', na=False)]
-        rev_primers = gene_primers[gene_primers['Oligo_Name'].str.contains('Rev|rev', na=False)]
-        
-        if len(fwd_primers) == 0 or len(rev_primers) == 0:
-            print(f"  ⚠ Warning: Missing forward or reverse primer for {gene}")
-            
-            # Calculate stats for whichever primer we have
-            fwd_seq = fwd_primers.iloc[0]['Sequence'] if len(fwd_primers) > 0 else None
-            rev_seq = rev_primers.iloc[0]['Sequence'] if len(rev_primers) > 0 else None
-            
-            fwd_stats = calculate_primer_stats(fwd_seq) if fwd_seq else {'length': None, 'gc_content': None, 'tm': None}
-            rev_stats = calculate_primer_stats(rev_seq) if rev_seq else {'length': None, 'gc_content': None, 'tm': None}
-            
-            missing_type = 'forward' if len(fwd_primers) == 0 else 'reverse'
-            
-            results.append({
-                'Gene': gene,
-                'Status': 'ERROR',
-                'Amplicon_Size_bp': None,
-                'Sequence_Type': 'N/A',
-                'Transcript_ID': 'N/A',
-                'Details': f'Missing {missing_type} primer',
-                'Fwd_Primer': fwd_seq,
-                'Rev_Primer': rev_seq,
-                'Fwd_Length': fwd_stats['length'],
-                'Rev_Length': rev_stats['length'],
-                'Fwd_GC%': fwd_stats['gc_content'],
-                'Rev_GC%': rev_stats['gc_content'],
-                'Fwd_Tm_C': fwd_stats['tm'],
-                'Rev_Tm_C': rev_stats['tm']
-            })
+    header_row, name_col, seq_col = _find_columns(raw)
+    first_row = 0 if header_row is None else header_row + 1
+
+    primers = []
+    for idx in range(first_row, len(raw)):
+        raw_seq = raw.iat[idx, seq_col] if seq_col < raw.shape[1] else None
+        if pd.isna(raw_seq) or not str(raw_seq).strip():
             continue
-        
-        fwd_seq = fwd_primers.iloc[0]['Sequence']
-        rev_seq = rev_primers.iloc[0]['Sequence']
-        
-        # Calculate primer stats FIRST (always, even if NCBI fails)
-        fwd_stats = calculate_primer_stats(fwd_seq)
-        rev_stats = calculate_primer_stats(rev_seq)
-        
-        # Get the locus for this gene (e.g., 'Chr1' from 'Chr1_L_Flank')
-        locus = gene_primers.iloc[0]['Locus']
-        
-        # Check if this is a chromosome-based query
-        if locus.startswith('Chr') or locus.startswith('chr'):
-            # Extract chromosome number/letter from locus
-            chrom = locus.replace('Chr', '').replace('chr', '')
-            print(f"  Detected chromosome query: Chr{chrom} (region: {gene})")
-            # Use locus as cache key so all regions from same chromosome share sequence
-            if locus not in gene_sequences:
-                genomic_seq, cds_seq, mrna_isoforms, gene_header = fetch_chromosome_sequence(chrom, organism)
-                gene_sequences[locus] = (genomic_seq, cds_seq, mrna_isoforms, gene_header)
-                time.sleep(0.35)
-            else:
-                genomic_seq, cds_seq, mrna_isoforms, gene_header = gene_sequences[locus]
-                print(f"  Using cached chromosome sequence for Chr{chrom}")
-        # Fetch gene sequence if not in cache
-        elif gene not in gene_sequences:
-            genomic_seq, cds_seq, mrna_isoforms, gene_header = fetch_gene_sequence(gene, organism)
-            gene_sequences[gene] = (genomic_seq, cds_seq, mrna_isoforms, gene_header)
-            time.sleep(0.35)  # Be nice to NCBI servers
-        else:
-            genomic_seq, cds_seq, mrna_isoforms, gene_header = gene_sequences[gene]
-            print(f"  Using cached sequences for {gene}")
-        
-        # Check the primer pair
-        result = check_primer_pair(fwd_seq, rev_seq, genomic_seq, cds_seq, mrna_isoforms, gene)
-        rev_stats = calculate_primer_stats(rev_seq)
-        
-        # Print result
-        status_symbol = '✓' if result['status'] == 'PASS' else ('⚠' if result['status'] == 'WARN' else '✗')
-        
-        # Add sequence type to print message
-        seq_type_msg = f" [{result.get('sequence_type', 'Unknown')}]" if result.get('sequence_type') else ""
-        print(f"  {status_symbol} {result['details']}{seq_type_msg}\n")
-        
-        # Prepare details with sequence type
-        details_with_note = result['details']
-        if result.get('sequence_type'):
-            details_with_note = f"[{result['sequence_type']}] {details_with_note}"
-        
-        # Add to results
-        results.append({
-            'Gene': gene,
-            'Status': result['status'],
-            'Amplicon_Size_bp': result['amplicon_size'],
-            'Sequence_Type': result.get('sequence_type', 'N/A'),
-            'Transcript_ID': result.get('transcript_id', 'N/A'),
-            'Details': details_with_note,
-            'Fwd_Primer': fwd_seq,
-            'Rev_Primer': rev_seq,
-            'Fwd_Length': fwd_stats['length'],
-            'Rev_Length': rev_stats['length'],
-            'Fwd_GC%': fwd_stats['gc_content'],
-            'Rev_GC%': rev_stats['gc_content'],
-            'Fwd_Tm_C': fwd_stats['tm'],
-            'Rev_Tm_C': rev_stats['tm']
-        })
-    
-    return pd.DataFrame(results)
+        seq = clean_sequence(raw_seq)
+        if header_row is None and (len(seq) < 10 or invalid_bases(seq)):
+            continue  # no header to anchor on: skip rows that aren't DNA
+        raw_name = raw.iat[idx, name_col]
+        name = str(raw_name).strip() if pd.notna(raw_name) and str(raw_name).strip() else f'Row{idx + 1}'
+        base, direction, num = parse_primer_name(name)
+        primer = Primer(name=name, seq=seq, row=idx + 1, base=base,
+                        direction=direction, pair_num=num, chrom=chromosome_of(base))
+        bad = invalid_bases(seq)
+        if bad:
+            primer.error = f"Invalid characters in sequence: {''.join(bad)}"
+        primer.stats = calculate_primer_stats(seq if not bad else '')
+        primers.append(primer)
 
-def print_summary(results_df):
-    """Print a summary of the validation results"""
-    print(f"\n{'='*70}")
-    print("VALIDATION SUMMARY")
-    print(f"{'='*70}\n")
-    
-    total = len(results_df)
-    passed = len(results_df[results_df['Status'] == 'PASS'])
-    warned = len(results_df[results_df['Status'] == 'WARN'])
-    failed = len(results_df[results_df['Status'] == 'FAIL'])
-    errors = len(results_df[results_df['Status'] == 'ERROR'])
-    
-    print(f"Total primer pairs checked: {total}")
-    print(f"✓ PASS (70-150 bp):         {passed} ({passed/total*100:.1f}%)")
-    print(f"⚠ WARN (wrong size):        {warned} ({warned/total*100:.1f}%)")
-    print(f"✗ FAIL (no amplicon):       {failed} ({failed/total*100:.1f}%)")
-    print(f"⚠ ERROR (missing primers):  {errors} ({errors/total*100:.1f}%)")
-    
-    if warned > 0:
-        print(f"\n{'='*70}")
-        print("PRIMERS WITH INCORRECT AMPLICON SIZE:")
-        print(f"{'='*70}\n")
-        warn_df = results_df[results_df['Status'] == 'WARN'][['Gene', 'Amplicon_Size_bp', 'Details']]
-        for _, row in warn_df.iterrows():
-            print(f"  {row['Gene']}: {row['Details']}")
-    
-    if failed > 0:
-        print(f"\n{'='*70}")
-        print("PRIMERS THAT FAILED:")
-        print(f"{'='*70}\n")
-        fail_df = results_df[results_df['Status'] == 'FAIL'][['Gene', 'Details']]
-        for _, row in fail_df.iterrows():
-            print(f"  {row['Gene']}: {row['Details']}")
+    print(f"✓ Found {len(primers)} primers")
+    return primers
+
+
+def pair_primers(primers):
+    """
+    Group primers into fwd/rev pairs by base name (and optional pair number).
+    Returns (pairs, unpaired). Groups with several fwd or rev primers give
+    every fwd x rev combination.
+    """
+    groups = {}
+    for p in primers:
+        if p.direction:
+            groups.setdefault(p.pair_key, []).append(p)
+
+    pairs = []
+    for members in groups.values():
+        fwds = [p for p in members if p.direction == 'F']
+        revs = [p for p in members if p.direction == 'R']
+        for f in fwds:
+            for r in revs:
+                pairs.append((f, r))
+                f.paired_with.append(r.name)
+                r.paired_with.append(f.name)
+    unpaired = [p for p in primers if not p.paired_with]
+    return pairs, unpaired
+
+
+# --------------------------------------------------------------------------
+# NCBI
+# --------------------------------------------------------------------------
+
+class NCBIError(Exception):
+    pass
+
+
+class NCBI:
+    """Minimal E-utilities client with rate limiting and retries.
+    Set NCBI_API_KEY to raise the limit from 3 to 10 requests/second."""
+    BASE = 'https://eutils.ncbi.nlm.nih.gov/entrez/eutils/'
+
+    def __init__(self, api_key=None, email=None):
+        self.session = requests.Session()
+        self.api_key = api_key
+        self.email = email
+        self.interval = 0.11 if api_key else 0.34
+        self._last = 0.0
+
+    def request(self, endpoint, **params):
+        params['tool'] = 'primer_validation_tool'
+        if self.api_key:
+            params['api_key'] = self.api_key
+        if self.email:
+            params['email'] = self.email
+        error = None
+        for attempt in range(5):
+            wait = self.interval - (time.monotonic() - self._last)
+            if wait > 0:
+                time.sleep(wait)
+            self._last = time.monotonic()
+            try:
+                # POST so long ID lists don't overflow the URL
+                r = self.session.post(self.BASE + endpoint, data=params, timeout=120)
+            except requests.RequestException as e:
+                error = str(e)
+            else:
+                if r.status_code == 200:
+                    return r
+                error = f'HTTP {r.status_code}'
+                if r.status_code not in (429, 500, 502, 503, 504):
+                    break
+            time.sleep(2 ** attempt)
+        raise NCBIError(f'{endpoint} failed: {error}')
+
+    def json(self, endpoint, **params):
+        data = self.request(endpoint, retmode='json', **params).json()
+        err = data.get('error') or data.get('esearchresult', {}).get('ERROR')
+        if err:
+            raise NCBIError(f'{endpoint}: {err}')
+        return data
+
+
+def parse_fasta(text):
+    records, header, chunks = [], None, []
+    for line in text.splitlines():
+        if line.startswith('>'):
+            if header is not None:
+                records.append((header, ''.join(chunks).upper()))
+            header, chunks = line[1:].strip(), []
+        elif header is not None:
+            chunks.append(line.strip())
+    if header is not None:
+        records.append((header, ''.join(chunks).upper()))
+    return records
+
+
+@dataclass
+class GeneRecord:
+    symbol: str
+    gene_id: str
+    description: str
+    note: str                 # e.g. "matched alias of Xyz"
+    chrom: str                # UCSC-style, e.g. 'chr6' (None if unplaced)
+    chrom_start: int          # 0-based span of the gene on the chromosome
+    chrom_end: int
+    transcripts: list         # [(accession, sequence)], NM_ first
+    genomic: str              # gene region +/- flank, in gene orientation
+    genomic_flank: int
+
+    def overlaps(self, chrom, start, end):
+        return (self.chrom == chrom and self.chrom_start is not None
+                and start < self.chrom_end + self.genomic_flank
+                and end > self.chrom_start - self.genomic_flank)
+
+
+def _accession_rank(acc):
+    order = {'NM': 0, 'NR': 1, 'XM': 2, 'XR': 3}
+    return (order.get(acc[:2], 4), acc)
+
+
+def fetch_gene(ncbi, symbol, organism, flank=1000, cache_dir=None, refresh=False):
+    """
+    Resolve a gene symbol in NCBI Gene and fetch all its RefSeq transcripts
+    plus its genomic region (+/- flank bp, gene orientation).
+    Returns a GeneRecord, or None if no gene with that symbol (or alias) exists.
+    Raises NCBIError on network/API failure.
+    """
+    cache_file = None
+    if cache_dir:
+        slug = re.sub(r'\W+', '_', organism.lower())
+        cache_file = Path(cache_dir) / 'ncbi' / slug / f'{symbol.lower()}_f{flank}.json'
+        if cache_file.exists() and not refresh:
+            return GeneRecord(**json.loads(cache_file.read_text()))
+
+    ids = ncbi.json('esearch.fcgi', db='gene', retmax=20,
+                    term=f'"{symbol}"[Gene Name] AND "{organism}"[Organism] AND alive[prop]'
+                    )['esearchresult'].get('idlist', [])
+    if not ids:
+        return None
+    summary = ncbi.json('esummary.fcgi', db='gene', id=','.join(ids))['result']
+    docs = [summary[i] for i in summary.get('uids', [])]
+
+    note = ''
+    match = next((d for d in docs if d.get('name', '').lower() == symbol.lower()), None)
+    if match is None:
+        alias_hits = [d for d in docs
+                      if symbol.lower() in [a.strip().lower() for a in d.get('otheraliases', '').split(',')]]
+        if not alias_hits:
+            return None
+        match = alias_hits[0]
+        note = f"'{symbol}' is an alias of {match['name']}"
+        if len(alias_hits) > 1:
+            note += f" (also an alias of {', '.join(d['name'] for d in alias_hits[1:])})"
+
+    gene_id = str(match['uid'])
+
+    # Transcripts: exactly this gene's RefSeq RNAs
+    links = ncbi.json('elink.fcgi', dbfrom='gene', db='nuccore', id=gene_id,
+                      linkname='gene_nuccore_refseqrna')
+    tx_ids = []
+    for linkset in links.get('linksets', []):
+        for lsdb in linkset.get('linksetdbs', []):
+            tx_ids.extend(lsdb.get('links', []))
+    transcripts = []
+    if tx_ids:
+        fasta = ncbi.request('efetch.fcgi', db='nuccore', id=','.join(map(str, tx_ids)),
+                             rettype='fasta', retmode='text').text
+        transcripts = sorted(((h.split()[0], s) for h, s in parse_fasta(fasta)),
+                             key=lambda t: _accession_rank(t[0]))
+
+    # Genomic region on the chromosome RefSeq
+    chrom = chrom_start = chrom_end = None
+    genomic = None
+    info = (match.get('genomicinfo') or [None])[0]
+    if info and info.get('chraccver'):
+        a, b = int(info['chrstart']), int(info['chrstop'])
+        chrom_start, chrom_end = min(a, b), max(a, b) + 1
+        loc = str(info.get('chrloc', ''))
+        chrom = 'chr' + ('M' if loc == 'MT' else loc) if loc else None
+        fasta = ncbi.request('efetch.fcgi', db='nuccore', id=info['chraccver'],
+                             rettype='fasta', retmode='text',
+                             seq_start=max(1, chrom_start + 1 - flank),
+                             seq_stop=chrom_end + flank,
+                             strand=2 if a > b else 1).text
+        records = parse_fasta(fasta)
+        genomic = records[0][1] if records else None
+
+    record = GeneRecord(symbol=match['name'], gene_id=gene_id,
+                        description=match.get('description', ''), note=note,
+                        chrom=chrom, chrom_start=chrom_start, chrom_end=chrom_end,
+                        transcripts=transcripts, genomic=genomic, genomic_flank=flank)
+    if cache_file:
+        cache_file.parent.mkdir(parents=True, exist_ok=True)
+        cache_file.write_text(json.dumps(record.__dict__))
+    return record
+
+
+def resolve_gene(ncbi, base, organism, gene_cache, opts):
+    """Look up the gene for a primer base name, trying fallbacks; memoised.
+    Returns (GeneRecord or None, error message or None)."""
+    errors = []
+    for symbol in gene_symbol_candidates(base):
+        key = symbol.lower()
+        if key not in gene_cache:
+            try:
+                gene_cache[key] = (fetch_gene(ncbi, symbol, organism, opts.flank,
+                                              opts.cache_dir, opts.refresh), None)
+            except NCBIError as e:
+                gene_cache[key] = (None, f'NCBI request failed: {e}')
+        gene, err = gene_cache[key]
+        if gene:
+            if symbol != base:
+                note = f"looked up as '{symbol}'"
+                gene = replace(gene, note=f'{gene.note}; {note}' if gene.note else note)
+            return gene, None
+        if err:
+            errors.append(err)
+    if errors:
+        return None, errors[0]
+    tried = "' / '".join(gene_symbol_candidates(base))
+    return None, f"No {organism} gene named '{tried}' in NCBI Gene"
+
+
+# --------------------------------------------------------------------------
+# Genome (UCSC downloads)
+# --------------------------------------------------------------------------
+
+def _download(url, dest):
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    tmp = dest.with_suffix(dest.suffix + '.part')
+    with requests.get(url, stream=True, timeout=120) as r:
+        if r.status_code != 200:
+            raise RuntimeError(f'download failed ({r.status_code}): {url}')
+        total = int(r.headers.get('Content-Length', 0))
+        done = 0
+        with open(tmp, 'wb') as fh:
+            for chunk in r.iter_content(1 << 20):
+                fh.write(chunk)
+                done += len(chunk)
+                if total:
+                    print(f'\r  Downloading {dest.name}: {done / 1e6:.0f}/{total / 1e6:.0f} MB',
+                          end='', flush=True)
+    print()
+    tmp.rename(dest)
+
+
+def genome_chromosomes(db, cache_dir):
+    """Primary chromosome names for a UCSC assembly (no random/Un/alt contigs)"""
+    path = Path(cache_dir) / 'genomes' / db / f'{db}.chrom.sizes'
+    if not path.exists():
+        _download(f'{UCSC_DOWNLOAD}/{db}/bigZips/{db}.chrom.sizes', path)
+    names = [line.split('\t')[0] for line in path.read_text().splitlines() if line.strip()]
+    return [n for n in names if re.fullmatch(r'chr(\d+|X|Y|M)', n)]
+
+
+def load_chromosome(db, chrom, cache_dir):
+    """Chromosome sequence (uppercase), downloaded once and cached on disk"""
+    path = Path(cache_dir) / 'genomes' / db / f'{chrom}.fa.gz'
+    if not path.exists():
+        _download(f'{UCSC_DOWNLOAD}/{db}/chromosomes/{chrom}.fa.gz', path)
+    with gzip.open(path, 'rt') as fh:
+        fh.readline()  # FASTA header
+        return fh.read().replace('\n', '').upper()
+
+
+def scan_genome(primers, chroms, db, cache_dir, max_mismatches, anchor_len=15,
+                max_sites=2000):
+    """
+    Find binding sites of every primer on the given chromosomes, both strands.
+    Like UCSC In-Silico PCR, the 3'-most `anchor_len` bases must match exactly;
+    up to `max_mismatches` are allowed in the rest of the primer.
+    Returns {primer index: [Site]} and a set of primer indexes that hit
+    max_sites (repetitive primers).
+    """
+    if ahocorasick is None:
+        raise RuntimeError('pyahocorasick is required for genome searches: pip install pyahocorasick')
+
+    automaton = ahocorasick.Automaton()
+    keys = {}
+    for i, p in enumerate(primers):
+        L = len(p.seq)
+        k = min(anchor_len, L)
+        for strand, probe in (('+', p.seq), ('-', reverse_complement(p.seq))):
+            offset = L - k if strand == '+' else 0
+            allowed = [IUPAC[b] for b in probe]
+            for anchor in _expand_degenerate(probe[offset:offset + k]) or []:
+                keys.setdefault(anchor, []).append((i, strand, offset, L, allowed))
+    if not keys:
+        return {}, set()
+    for anchor, value in keys.items():
+        automaton.add_word(anchor, (len(anchor), value))
+    automaton.make_automaton()
+
+    sites = {i: [] for i in range(len(primers))}
+    saturated = set()
+    for chrom in chroms:
+        seq = load_chromosome(db, chrom, cache_dir)
+        print(f'  Scanning {db} {chrom}...', end=' ', flush=True)
+        t0 = time.time()
+        for end, (k, entries) in automaton.iter(seq):
+            anchor_start = end - k + 1
+            for i, strand, offset, L, allowed in entries:
+                if i in saturated:
+                    continue
+                start = anchor_start - offset
+                if start < 0 or start + L > len(seq):
+                    continue
+                mm = _count_mismatches(allowed, seq[start:start + L], max_mismatches)
+                if mm <= max_mismatches:
+                    sites[i].append(Site(start, start + L, strand, mm, primer=i, chrom=chrom))
+                    if len(sites[i]) >= max_sites:
+                        saturated.add(i)
+        del seq
+        print(f'{time.time() - t0:.0f}s')
+    return sites, saturated
+
+
+def genome_products(primer_ids, genome_sites, max_size):
+    """Every product formed by any combination of the given primers, genome-wide"""
+    by_chrom = {}
+    for i in primer_ids:
+        for s in genome_sites.get(i, []):
+            by_chrom.setdefault(s.chrom, []).append(s)
+    products = []
+    for chrom_sites in by_chrom.values():
+        products.extend(find_products(chrom_sites, max_size))
+    return sorted(products, key=lambda p: p.size)
+
+
+def describe_sites(sites, limit=5):
+    if not sites:
+        return ''
+    shown = '; '.join(f"{s.chrom + ':' if s.chrom else ''}{s.start + 1}({s.strand})"
+                      + (f' {s.mismatches}mm' if s.mismatches else '') for s in sites[:limit])
+    more = f' ... +{len(sites) - limit} more' if len(sites) > limit else ''
+    return f'{len(sites)} site(s): {shown}{more}'
+
+
+def describe_products(products, names, limit=5):
+    """'chr1:100-250 (151 bp, A+B); ...'"""
+    parts = [f'{p.location()} ({p.size} bp, {names[p.left.primer]}+{names[p.right.primer]})'
+             for p in products[:limit]]
+    more = f' ... +{len(products) - limit} more' if len(products) > limit else ''
+    return '; '.join(parts) + more
+
+
+# --------------------------------------------------------------------------
+# Evaluation
+# --------------------------------------------------------------------------
+
+def blank_result(fwd, rev, target):
+    return {
+        'Pair': f'{fwd.name} + {rev.name}',
+        'Target': target,
+        'Status': 'FAIL',
+        'Amplicon_Size_bp': None,
+        'Details': '',
+        'Matched_Transcripts': '',
+        'Transcripts_Amplified': '',
+        'Genomic_Amplicon_bp': None,
+        'Genome_Products': '',
+        'Fwd_Name': fwd.name,
+        'Rev_Name': rev.name,
+        'Fwd_Primer': fwd.seq,
+        'Rev_Primer': rev.seq,
+        'Fwd_Length': fwd.stats.get('length'),
+        'Rev_Length': rev.stats.get('length'),
+        'Fwd_GC%': fwd.stats.get('gc_content'),
+        'Rev_GC%': rev.stats.get('gc_content'),
+        'Fwd_Tm_C': fwd.stats.get('tm'),
+        'Rev_Tm_C': rev.stats.get('tm'),
+        'Fwd_Mismatches': None,
+        'Rev_Mismatches': None,
+    }
+
+
+def evaluate_gene_pair(fwd, rev, gene, opts, genome=None):
+    """Check a fwd/rev pair against a gene's transcripts and genomic region"""
+    result = blank_result(fwd, rev, gene.symbol)
+    if gene.description:
+        result['Target'] = f'{gene.symbol} ({gene.description})'
+    notes, warnings = [], []
+    if gene.note:
+        notes.append(gene.note)
+
+    def run(seq):
+        return evaluate_on_sequence(fwd.seq, rev.seq, seq, opts.max_mismatches,
+                                    opts.exact_3prime, opts.max_product)
+
+    tx_results = [(acc, run(seq)) for acc, seq in gene.transcripts]
+    gen = run(gene.genomic) if gene.genomic else None
+    amplified = [(acc, r) for acc, r in tx_results if r.products]
+    result['Transcripts_Amplified'] = f'{len(amplified)}/{len(tx_results)}'
+    result['Matched_Transcripts'] = '; '.join(
+        f"{acc} ({', '.join(str(p.size) for p in r.products)} bp)" for acc, r in amplified)
+    if gen and gen.products:
+        result['Genomic_Amplicon_bp'] = gen.products[0].size
+
+    if amplified:
+        acc, primary = amplified[0]
+        product = primary.products[0]
+        size = product.size
+        result['Amplicon_Size_bp'] = size
+        f_mm, r_mm = product_mismatches(product)
+        result['Fwd_Mismatches'], result['Rev_Mismatches'] = f_mm, r_mm
+
+        if opts.min_size <= size <= opts.max_size:
+            notes.insert(0, f'Amplicon {size} bp on {acc}')
+        else:
+            warnings.append(f'Amplicon {size} bp on {acc} is outside {opts.min_size}-{opts.max_size} bp')
+        if f_mm or r_mm:
+            warnings.append(f'Mismatches vs {acc}: Fwd {f_mm}, Rev {r_mm}')
+        if len(primary.products) > 1:
+            warnings.append(f'{len(primary.products)} products on {acc}: '
+                            + ', '.join(f'{p.size} bp' for p in primary.products))
+        if primary.extra:
+            warnings.append(f'Single-primer product(s) on {acc}: '
+                            + ', '.join(f'{p.size} bp' for p in primary.extra))
+        if product.left.primer == 'R':
+            notes.append('Fwd/Rev are swapped relative to the transcript orientation')
+        sizes = {p.products[0].size for _, p in amplified}
+        if len(sizes) > 1:
+            notes.append(f"Product size varies between isoforms ({', '.join(map(str, sorted(sizes)))} bp)")
+        if len(amplified) < len(tx_results):
+            notes.append(f'Does not amplify {len(tx_results) - len(amplified)} of {len(tx_results)} transcripts')
+        if gen is not None:
+            if gen.products:
+                notes.append(f'Also amplifies genomic DNA ({gen.products[0].size} bp): does not span an intron')
+            else:
+                notes.append(f'No genomic DNA product <= {opts.max_product} bp (spans an intron/exon junction)')
+        result['Status'] = 'WARN' if warnings else 'PASS'
+    elif gen and gen.products:
+        product = gen.products[0]
+        result['Amplicon_Size_bp'] = product.size
+        result['Fwd_Mismatches'], result['Rev_Mismatches'] = product_mismatches(product)
+        warnings.append(f'No product on any of {len(tx_results)} RefSeq transcripts; '
+                        f'product only on genomic DNA ({product.size} bp)')
+        if not opts.min_size <= product.size <= opts.max_size:
+            warnings.append(f'Size outside {opts.min_size}-{opts.max_size} bp')
+        result['Status'] = 'WARN'
+    else:
+        all_results = [r for _, r in tx_results] + ([gen] if gen else [])
+        f_binds = any(r.fwd_sites for r in all_results)
+        r_binds = any(r.rev_sites for r in all_results)
+        where = f'{gene.symbol} transcripts or genomic region'
+        if not f_binds and not r_binds:
+            result['Details'] = f'Neither primer binds {where}'
+        elif not f_binds:
+            result['Details'] = f'Forward primer does not bind {where}'
+        elif not r_binds:
+            result['Details'] = f'Reverse primer does not bind {where}'
+        else:
+            result['Details'] = (f'Both primers bind {gene.symbol} but form no product '
+                                 f'<= {opts.max_product} bp (wrong orientation or too far apart)')
+        if not gene.transcripts and not gene.genomic:
+            result['Status'] = 'ERROR'
+            result['Details'] = f'No sequences available for {gene.symbol} in NCBI'
+
+    if genome is not None:
+        products, names, saturated = genome
+        on = [p for p in products if gene.overlaps(p.chrom, p.left.start, p.right.end)]
+        off = [p for p in products if p not in on]
+        result['Genome_Products'] = (f'{len(on)} on-target, {len(off)} off-target'
+                                     + (f': {describe_products(off, names)}' if off else ''))
+        if saturated:
+            warnings.append('Primer is repetitive (too many genome sites to list)')
+        if off:
+            warnings.append(f'{len(off)} off-target genome product(s)')
+            if result['Status'] == 'PASS':
+                result['Status'] = 'WARN'
+
+    if result['Status'] in ('PASS', 'WARN'):
+        result['Details'] = '; '.join(warnings + notes)
+    elif warnings or notes:
+        result['Details'] = '; '.join([result['Details']] + warnings + notes)
+    return result
+
+
+def evaluate_chrom_pair(fwd, rev, f_idx, r_idx, genome_sites, saturated, names, opts):
+    """Check an explicit fwd/rev pair whose name refers to a chromosome locus"""
+    result = blank_result(fwd, rev, fwd.chrom)
+    products = genome_products([f_idx, r_idx], genome_sites, opts.max_product)
+    pair_products = [p for p in products if p.left.primer != p.right.primer]
+    on = [p for p in pair_products if p.chrom == fwd.chrom]
+    off = [p for p in products if p not in on]
+    if off:
+        result['Genome_Products'] = f'{len(off)} other: {describe_products(off, names)}'
+
+    if not on:
+        f_here = [s for s in genome_sites.get(f_idx, []) if s.chrom == fwd.chrom]
+        r_here = [s for s in genome_sites.get(r_idx, []) if s.chrom == fwd.chrom]
+        if not f_here and not r_here:
+            result['Details'] = f'Neither primer binds {fwd.chrom}'
+        elif not f_here:
+            result['Details'] = f'Forward primer does not bind {fwd.chrom}'
+        elif not r_here:
+            result['Details'] = f'Reverse primer does not bind {fwd.chrom}'
+        else:
+            result['Details'] = (f'Both primers bind {fwd.chrom} but form no product '
+                                 f'<= {opts.max_product} bp')
+        return result
+
+    product = on[0]
+    left_is_fwd = product.left.primer == f_idx
+    f_mm = product.left.mismatches if left_is_fwd else product.right.mismatches
+    r_mm = product.right.mismatches if left_is_fwd else product.left.mismatches
+    result.update({'Amplicon_Size_bp': product.size, 'Fwd_Mismatches': f_mm, 'Rev_Mismatches': r_mm})
+    warnings = []
+    if len(on) > 1:
+        warnings.append(f'{len(on)} products on {fwd.chrom}: {describe_products(on, names)}')
+    if f_mm or r_mm:
+        warnings.append(f'Mismatches: Fwd {f_mm}, Rev {r_mm}')
+    if off:
+        warnings.append(f'{len(off)} other product(s) incl. single-primer/off-chromosome')
+    if {f_idx, r_idx} & saturated:
+        warnings.append('Primer is repetitive (too many genome sites to list)')
+    result['Status'] = 'WARN' if warnings else 'PASS'
+    result['Details'] = '; '.join(warnings + [f'Product {product.location()} ({product.size} bp); '
+                                              f'qPCR size window not applied to chromosome loci'])
+    return result
+
+
+def inferred_rows(group_ids, primers, genome_sites, names, opts, existing_pairs, chrom=None):
+    """Products formed by primers that have no named partner (e.g. Chr1_L_Flank + Chr1_L_Int)"""
+    rows = []
+    products = genome_products(group_ids, genome_sites, opts.max_product)
+    for p in products:
+        if chrom and p.chrom != chrom:
+            continue
+        a, b = primers[p.left.primer], primers[p.right.primer]
+        if frozenset((a.name, b.name)) in existing_pairs:
+            continue
+        row = blank_result(a, b, p.chrom)
+        row.update({
+            'Pair': f'{a.name} + {b.name}' if a is not b else f'{a.name} (alone)',
+            'Status': 'INFERRED',
+            'Amplicon_Size_bp': p.size,
+            'Fwd_Mismatches': p.left.mismatches,
+            'Rev_Mismatches': p.right.mismatches,
+            'Details': (f'Product {p.location()} ({p.size} bp) predicted from binding sites'
+                        + ('; single primer primes both ends' if a is b else '')),
+        })
+        rows.append(row)
+    return rows
+
+
+# --------------------------------------------------------------------------
+# Main workflow
+# --------------------------------------------------------------------------
+
+def validate(primers, opts):
+    """Run all checks; returns (pairs DataFrame, primers DataFrame)"""
+    pairs, unpaired = pair_primers(primers)
+    index = {id(p): i for i, p in enumerate(primers)}
+    names = {i: p.name for i, p in enumerate(primers)}
+    rows = []
+
+    # ---- Genome scan (chromosome loci, and everything with --genome-check)
+    genome_sites, saturated = {}, set()
+    chrom_needed = {p.chrom for p in primers if p.chrom and not p.error}
+    db = opts.genome_db or UCSC_DBS.get(opts.organism.lower())
+    genome_error = None
+    if chrom_needed or opts.genome_check:
+        if not db:
+            genome_error = (f"No UCSC assembly known for '{opts.organism}'; pass --genome-db "
+                            f"(e.g. {', '.join(sorted(UCSC_DBS.values()))})")
+        else:
+            try:
+                if opts.genome_check:
+                    chroms = genome_chromosomes(db, opts.cache_dir)
+                    scan_ids = [i for i, p in enumerate(primers) if not p.error]
+                else:
+                    chroms = sorted(chrom_needed, key=lambda c: (len(c), c))
+                    scan_ids = [i for i, p in enumerate(primers) if p.chrom and not p.error]
+                print(f"\n{'=' * 70}\nSearching {len(scan_ids)} primers on {db} "
+                      f"({len(chroms)} chromosome{'s' if len(chroms) > 1 else ''})\n{'=' * 70}")
+                sub = [primers[i] for i in scan_ids]
+                sites, sat = scan_genome(sub, chroms, db, opts.cache_dir, opts.max_mismatches,
+                                         opts.anchor)
+                # Re-key by index in the full primer list
+                for j, i in enumerate(scan_ids):
+                    genome_sites[i] = sites.get(j, [])
+                    for s in genome_sites[i]:
+                        s.primer = i
+                saturated = {scan_ids[j] for j in sat}
+            except Exception as e:
+                genome_error = f'Genome search failed: {e}'
+                print(f'  ❌ {genome_error}')
+
+    # ---- Pairs
+    ncbi = NCBI(os.environ.get('NCBI_API_KEY'), os.environ.get('NCBI_EMAIL'))
+    gene_cache = {}
+    print(f"\n{'=' * 70}\nValidating {len(pairs)} primer pairs against {opts.organism}\n{'=' * 70}\n")
+    for n, (fwd, rev) in enumerate(pairs, 1):
+        f_idx, r_idx = index[id(fwd)], index[id(rev)]
+        print(f'[{n}/{len(pairs)}] {fwd.name} + {rev.name}')
+        if fwd.error or rev.error:
+            row = blank_result(fwd, rev, fwd.label)
+            row.update(Status='ERROR', Details='; '.join(e for e in (fwd.error, rev.error) if e))
+        elif fwd.chrom:
+            if genome_error or db is None:
+                row = blank_result(fwd, rev, fwd.chrom)
+                row.update(Status='ERROR', Details=genome_error or 'Genome not searched')
+            else:
+                row = evaluate_chrom_pair(fwd, rev, f_idx, r_idx, genome_sites, saturated, names, opts)
+        else:
+            gene, err = resolve_gene(ncbi, fwd.base, opts.organism, gene_cache, opts)
+            if gene is None:
+                row = blank_result(fwd, rev, fwd.label)
+                row.update(Status='ERROR', Details=err)
+            else:
+                genome = None
+                if opts.genome_check and not genome_error:
+                    genome = (genome_products([f_idx, r_idx], genome_sites, opts.max_product),
+                              names, {f_idx, r_idx} & saturated)
+                row = evaluate_gene_pair(fwd, rev, gene, opts, genome)
+        symbol = {'PASS': '✓', 'WARN': '⚠', 'FAIL': '✗', 'ERROR': '✗'}[row['Status']]
+        print(f"  {symbol} {row['Status']}: {row['Details']}\n")
+        rows.append(row)
+
+    # ---- Primers without a named partner
+    existing = {frozenset((f.name, r.name)) for f, r in pairs}
+    chrom_groups = {}
+    for p in primers:
+        if p.chrom and not p.error:
+            chrom_groups.setdefault(p.chrom, []).append(index[id(p)])
+    if not genome_error:
+        for chrom, ids in chrom_groups.items():
+            rows.extend(inferred_rows(ids, primers, genome_sites, names, opts, existing, chrom))
+        loose = [index[id(p)] for p in unpaired if not p.chrom and not p.error]
+        if opts.genome_check and loose:
+            rows.extend(inferred_rows(loose, primers, genome_sites, names, opts, existing))
+
+    for p in unpaired:
+        if p.error:
+            p.binding = p.error
+        elif p.chrom or opts.genome_check:
+            continue  # described from genome sites below
+        else:
+            gene, err = resolve_gene(ncbi, p.base, opts.organism, gene_cache, opts)
+            if gene is None:
+                p.binding = err
+                continue
+            parts = []
+            for acc, seq in gene.transcripts:
+                sites = find_primer_sites(p.seq, seq, opts.max_mismatches, opts.exact_3prime)
+                if sites:
+                    parts.append(f'{acc} {describe_sites(sites, 2)}')
+                    break
+            if gene.genomic:
+                sites = find_primer_sites(p.seq, gene.genomic, opts.max_mismatches, opts.exact_3prime)
+                parts.append(f'{gene.symbol} genomic region: {describe_sites(sites, 3)}' if sites
+                             else f'does not bind {gene.symbol} genomic region (±{opts.flank} bp)')
+            p.binding = '; '.join(([gene.note] if gene.note else []) + parts) or f'does not bind {gene.symbol}'
+    for i, p in enumerate(primers):
+        if genome_error and not p.binding and (p.chrom or opts.genome_check):
+            p.binding = genome_error
+        if i in genome_sites and not p.binding:
+            p.binding = (describe_sites(genome_sites[i]) or f'no binding site in {db}'
+                         if i not in saturated else 'repetitive: too many genome sites')
+
+    pairs_df = pd.DataFrame(rows, columns=list(blank_result(Primer('', '', 0), Primer('', '', 0), '').keys()))
+    if not pairs_df.empty:
+        pairs_df['_order'] = pairs_df['Status'].map(STATUS_ORDER)
+        pairs_df = pairs_df.sort_values('_order', kind='stable').drop(columns='_order')
+
+    primers_df = pd.DataFrame([{
+        'Row': p.row,
+        'Name': p.name,
+        'Sequence': p.seq,
+        'Direction': {'F': 'Fwd', 'R': 'Rev'}.get(p.direction, ''),
+        'Paired_With': ', '.join(p.paired_with) if p.paired_with else '(no partner)',
+        'Length': p.stats.get('length'),
+        'GC%': p.stats.get('gc_content'),
+        'Tm_C': p.stats.get('tm'),
+        'Binding': p.binding,
+    } for p in primers])
+    return pairs_df, primers_df, unpaired
+
+
+def print_summary(pairs_df, unpaired, opts):
+    print(f"\n{'=' * 70}\nVALIDATION SUMMARY\n{'=' * 70}\n")
+    named = pairs_df[pairs_df['Status'] != 'INFERRED']
+    total = len(named)
+    counts = named['Status'].value_counts()
+    labels = [
+        ('PASS', '✓', f'PASS ({opts.min_size}-{opts.max_size} bp, clean)'),
+        ('WARN', '⚠', 'WARN (see Details)'),
+        ('FAIL', '✗', 'FAIL (no product)'),
+        ('ERROR', '✗', 'ERROR (lookup/input problem)'),
+    ]
+    print(f'Primer pairs checked: {total}')
+    for status, sym, label in labels:
+        c = int(counts.get(status, 0))
+        pct = f' ({c / total * 100:.1f}%)' if total else ''
+        print(f'{sym} {label:<32} {c}{pct}')
+    inferred = int((pairs_df['Status'] == 'INFERRED').sum())
+    if inferred:
+        print(f'ℹ Inferred products from unpartnered primers: {inferred}')
+    if unpaired:
+        print(f"\nPrimers without a Fwd/Rev partner ({len(unpaired)}): "
+              + ', '.join(p.name for p in unpaired))
+        print('  (name pairs as <Name>_Fwd / <Name>_Rev to have them checked as a pair)')
+
+    for status, title in (('WARN', 'PAIRS WITH WARNINGS'), ('FAIL', 'PAIRS THAT FAILED'),
+                          ('ERROR', 'PAIRS WITH ERRORS')):
+        subset = named[named['Status'] == status]
+        if len(subset):
+            print(f"\n{'=' * 70}\n{title}:\n{'=' * 70}")
+            for _, row in subset.iterrows():
+                print(f"  {row['Pair']}: {row['Details']}")
+
+
+def write_report(pairs_df, primers_df, output_file, opts):
+    settings = pd.DataFrame([
+        ('Run', datetime.now().strftime('%Y-%m-%d %H:%M')),
+        ('Organism', opts.organism),
+        ('Target amplicon size', f'{opts.min_size}-{opts.max_size} bp'),
+        ('Max product size considered', f'{opts.max_product} bp'),
+        ('Max mismatches per primer', opts.max_mismatches),
+        ("3' bases that must match (gene check)", opts.exact_3prime),
+        ("3' bases that must match (genome search)", opts.anchor),
+        ('Genome-wide off-target check', 'yes' if opts.genome_check else 'no'),
+        ('Genome assembly', opts.genome_db or UCSC_DBS.get(opts.organism.lower(), '')),
+        ('Tm method', 'Primer3 nearest-neighbour (SantaLucia 1998); '
+                      '50 mM Na+, 1.5 mM Mg2+, 0.6 mM dNTP, 50 nM oligo'),
+    ], columns=['Setting', 'Value'])
+
+    with pd.ExcelWriter(output_file, engine='openpyxl') as writer:
+        for name, df in (('Pairs', pairs_df), ('Primers', primers_df), ('Settings', settings)):
+            df.to_excel(writer, index=False, sheet_name=name)
+            ws = writer.sheets[name]
+            ws.freeze_panes = 'A2'
+            for col in ws.columns:
+                width = max((len(str(c.value)) for c in col if c.value is not None), default=8)
+                ws.column_dimensions[col[0].column_letter].width = min(max(width + 2, 8), 60)
+
 
 def select_input_file():
     """Interactive file selection"""
-    print("\n" + "="*70)
+    print("\n" + "=" * 70)
     print("PRIMER VALIDATION TOOL")
-    print("="*70)
+    print("=" * 70)
     print("\nPlease enter the path to your Excel file:")
     print("(You can drag and drop the file here, or type the path)")
     filepath = input("\nFile path: ").strip().strip('"').strip("'")
-    
     if not os.path.exists(filepath):
         print(f"\n❌ Error: File not found: {filepath}")
         sys.exit(1)
-    
     return filepath
 
-def main():
+
+def build_parser():
     parser = argparse.ArgumentParser(
-        description='Validate primer pairs against mouse genes',
+        description='Validate PCR primer pairs against NCBI genes and the genome',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
   python check_primers.py                              # Interactive mode
   python check_primers.py primers.xlsx                 # Specify input file
   python check_primers.py primers.xlsx -o results.xlsx # Custom output name
-        """
-    )
-    parser.add_argument('input_file', nargs='?', help='Input Excel file with primers')
-    parser.add_argument('-o', '--output', help='Output Excel file name (default: primer_validation_results.xlsx)')
-    parser.add_argument('--organism', default='Mus musculus', help='Organism name (default: Mus musculus)')
-    
-    args = parser.parse_args()
-    
-    # Get input file
-    if args.input_file:
-        input_file = args.input_file
-        if not os.path.exists(input_file):
-            print(f"\n❌ Error: File not found: {input_file}")
-            sys.exit(1)
-    else:
-        input_file = select_input_file()
-    
-    # Set output file
-    if args.output:
-        output_file = args.output
-    else:
-        base_name = os.path.splitext(os.path.basename(input_file))[0]
-        output_file = f"{base_name}_validation_results.xlsx"
-    
-    # Load primers
-    try:
-        primers_df = load_primers_from_excel(input_file)
-    except Exception as e:
-        print(f"\n❌ Error loading Excel file: {str(e)}")
-        print("\nMake sure the file is in the correct format (IDT template)")
+  python check_primers.py primers.xlsx --genome-check  # Also look for off-target products
+
+Environment:
+  NCBI_API_KEY   raises NCBI's rate limit from 3 to 10 requests/second
+  NCBI_EMAIL     contact address NCBI asks scripted clients to send
+  PRIMER_TOOL_CACHE  cache directory (default ~/.cache/primer_validation_tool)
+        """)
+    parser.add_argument('input_file', nargs='?', help='Excel (.xlsx) or CSV file with primers')
+    parser.add_argument('-o', '--output', help='Output Excel file (default: <input>_validation_results.xlsx)')
+    parser.add_argument('--sheet', help='Worksheet name (default: first sheet)')
+    parser.add_argument('--organism', default='Mus musculus', help='Organism (default: Mus musculus)')
+    parser.add_argument('--min-size', type=int, default=70, help='Minimum target amplicon size (default 70)')
+    parser.add_argument('--max-size', type=int, default=150, help='Maximum target amplicon size (default 150)')
+    parser.add_argument('--max-product', type=int, default=4000,
+                        help='Largest product considered amplifiable, for gDNA/off-target/locus '
+                             'products (default 4000)')
+    parser.add_argument('--max-mismatches', type=int, default=1,
+                        help="Mismatches tolerated per primer outside its 3' end (default 1); "
+                             'any mismatch makes the pair WARN')
+    parser.add_argument('--exact-3prime', type=int, default=5,
+                        help="3' bases that must match exactly in gene checks (default 5)")
+    parser.add_argument('--anchor', type=int, default=15,
+                        help="3' bases that must match exactly in genome searches (default 15)")
+    parser.add_argument('--flank', type=int, default=1000,
+                        help='bp either side of the gene included in its genomic region (default 1000)')
+    parser.add_argument('--genome-check', action='store_true',
+                        help='Search the whole genome for off-target products '
+                             '(first run downloads the genome, ~800 MB for mouse)')
+    parser.add_argument('--genome-db', help='UCSC assembly to use (default: from --organism, e.g. mm39)')
+    parser.add_argument('--cache-dir', default=str(DEFAULT_CACHE), help=f'Cache directory (default {DEFAULT_CACHE})')
+    parser.add_argument('--refresh', action='store_true', help='Ignore cached NCBI gene data')
+    return parser
+
+
+def main():
+    opts = build_parser().parse_args()
+
+    input_file = opts.input_file or select_input_file()
+    if not os.path.exists(input_file):
+        print(f"\n❌ Error: File not found: {input_file}")
         sys.exit(1)
-    
-    # Validate primers
-    results_df = validate_all_primers(primers_df, args.organism)
-    
-    # Print summary
-    print_summary(results_df)
-    
-    # Save results
-    print(f"\n{'='*70}")
-    print(f"Saving results to: {output_file}")
-    
-    # Sort by status (FAIL first, then WARN, then PASS)
-    status_order = {'FAIL': 0, 'ERROR': 1, 'WARN': 2, 'PASS': 3}
-    results_df['_sort'] = results_df['Status'].map(status_order)
-    results_df = results_df.sort_values('_sort').drop('_sort', axis=1)
-    
-    results_df.to_excel(output_file, index=False, sheet_name='Validation Results')
-    
-    print(f"✓ Results saved successfully!")
-    print(f"\n{'='*70}\n")
+    output_file = opts.output or f"{os.path.splitext(os.path.basename(input_file))[0]}_validation_results.xlsx"
+
+    try:
+        primers = load_primers(input_file, opts.sheet)
+    except Exception as e:
+        print(f"\n❌ Error loading primer file: {e}")
+        sys.exit(1)
+    if not primers:
+        print("\n❌ No primer sequences found (expected 'Name' and 'Sequence' columns)")
+        sys.exit(1)
+
+    pairs_df, primers_df, unpaired = validate(primers, opts)
+    print_summary(pairs_df, unpaired, opts)
+
+    print(f"\n{'=' * 70}\nSaving results to: {output_file}")
+    write_report(pairs_df, primers_df, output_file, opts)
+    print(f"✓ Results saved (sheets: Pairs, Primers, Settings)\n{'=' * 70}\n")
+
 
 if __name__ == "__main__":
     main()
