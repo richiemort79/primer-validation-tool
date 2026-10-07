@@ -193,3 +193,80 @@ def test_load_primers_few_columns(tmp_path):
     path = tmp_path / 'p.csv'
     path.write_text('Name,Sequence\nA_Fwd,ACGTACGTACGT\nA_Rev,TTTTACGTACGT\n')
     assert [p.name for p in cp.load_primers(path)] == ['A_Fwd', 'A_Rev']
+
+
+# --- Alternative primers (--suggest) -------------------------------------------
+
+def _gene_model(seed=7):
+    """Synthetic gene: three exons separated by two 1 kb introns"""
+    exons = [_random_seq(200, seed), _random_seq(180, seed + 1), _random_seq(220, seed + 2)]
+    introns = ['GT' + _random_seq(996, seed + 3) + 'AG', 'GT' + _random_seq(996, seed + 4) + 'AG']
+    genomic = _random_seq(300, seed + 5) + exons[0] + introns[0] + exons[1] + introns[1] + exons[2]
+    return ''.join(exons), genomic
+
+
+def test_map_exons_and_junctions():
+    transcript, genomic = _gene_model()
+    exons = cp.map_exons(transcript, genomic)
+    assert [(a, b) for a, b, _ in exons] == [(0, 200), (200, 380), (380, 600)]
+    assert [j for j, _ in cp.exon_junctions(exons)] == [200, 380]
+    assert all(abs(intron - 1000) <= 2 for _, intron in cp.exon_junctions(exons))
+
+
+def test_map_exons_tolerates_snp():
+    transcript, genomic = _gene_model()
+    pos = genomic.index(transcript[50:70]) + 10                 # a base inside exon 1
+    genomic = genomic[:pos] + ('A' if genomic[pos] != 'A' else 'C') + genomic[pos + 1:]
+    assert [(a, b) for a, b, _ in cp.map_exons(transcript, genomic)] == [(0, 200), (200, 380), (380, 600)]
+
+
+class _Opts:
+    min_size, max_size, max_product = 70, 150, 4000
+    max_mismatches, exact_3prime = 1, 5
+
+
+def test_design_primer3_avoids_genomic_dna():
+    transcript, genomic = _gene_model()
+    exons = cp.map_exons(transcript, genomic)
+    designs = cp.design_primer3(transcript, cp.exon_junctions(exons), _Opts)
+    assert designs
+    for c in designs:
+        kind, how, _ = cp.intron_spanning(c.fwd, c.rev, transcript, exons, _Opts)
+        assert kind in (0, 1), how
+        assert not cp.evaluate_on_sequence(c.fwd, c.rev, genomic, 1, 5, 4000).products
+
+
+def test_intron_spanning_within_exon():
+    transcript, genomic = _gene_model()
+    exons = cp.map_exons(transcript, genomic)
+    fwd, rev = transcript[20:40], cp.reverse_complement(transcript[120:140])
+    assert cp.intron_spanning(fwd, rev, transcript, exons, _Opts)[0] == 2
+
+
+PRIMERBANK_PAGE = """<html><body>
+<p>Primer Pair 1 (Click here for cDNA and amplicon sequence) :</p>
+<table><tr><td>PrimerBank ID</td><td>142353045c1</td></tr>
+<tr><td>Amplicon Size</td><td>88</td></tr>
+<tr><td>Forward Primer</td><td>GGTGTCCCAAGACAACTTGTAA</td><td>22</td></tr>
+<tr><td>Reverse Primer</td><td>CTCTCCAGCAGTTAGACCCCT</td><td>21</td></tr></table>
+<p>Primer Pair 2 (Click here for cDNA and amplicon sequence) :</p>
+<p>Validation Results&nbsp;&nbsp; (Click here to view experimental validation data)</p>
+<table><tr><td>PrimerBank ID</td><td>31981217a1</td></tr>
+<tr><td>Forward Primer</td><td>GAGCTTCCTTCCCGTGCTT</td></tr>
+<tr><td>Reverse Primer</td><td>TGCCTGTTCCAGGTTTTAGTTAC</td></tr></table>
+</body></html>"""
+
+
+def test_fetch_primerbank_parses_page(monkeypatch):
+    class Response:
+        text = PRIMERBANK_PAGE
+
+        def raise_for_status(self):
+            pass
+    monkeypatch.setattr(cp.requests, 'post', lambda *a, **k: Response())
+    pairs, err = cp.fetch_primerbank('Pmel', 'Mus musculus')
+    assert err is None
+    assert [(c.source_id, c.fwd, c.rev, c.validated) for c in pairs] == [
+        ('142353045c1', 'GGTGTCCCAAGACAACTTGTAA', 'CTCTCCAGCAGTTAGACCCCT', False),
+        ('31981217a1', 'GAGCTTCCTTCCCGTGCTT', 'TGCCTGTTCCAGGTTTTAGTTAC', True)]
+    assert cp.fetch_primerbank('Pmel', 'Danio rerio') == ([], None)   # mouse/human only

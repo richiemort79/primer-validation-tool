@@ -1,5 +1,13 @@
 # Changelog
 
+## Version 2.2.0 (2026-10-07)
+
+### New
+- `--suggest`: for pairs that don't span an intron or that WARN/FAIL, suggests up to `--suggest-count` (default 3) better pairs on a new Alternatives sheet
+  - candidates from Harvard PrimerBank (mouse/human; lab-validated pairs marked) and Primer3 designs around every exon junction (junction-crossing, or flanking introns too long to amplify)
+  - exon structure derived from the transcript vs the gene's genomic sequence
+  - every candidate gets the same checks as the input primers (all transcripts, genomic region, genome with `--genome-check`); only clean, genomic-DNA-safe pairs are offered, ranked by isoform coverage, lab validation and design quality, with no overlapping primer positions
+
 ## Version 2.1.0 (2026-10-07)
 
 ### Output

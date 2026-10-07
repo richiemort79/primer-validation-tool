@@ -5,6 +5,7 @@ A Python script that checks PCR primers in silico before you order them or run t
 - **Gene-targeted pairs** (e.g. `Mitf_Fwd` / `Mitf_Rev`) are tested against **every RefSeq transcript** of the gene and against the gene's **genomic region**, using NCBI. You get the amplicon size, which isoforms it amplifies, and whether it spans an intron (no genomic DNA product).
 - **Chromosome-locus primers** (e.g. `Chr1_L_Flank`, `Chr1_R_Int`) are located on that chromosome, on both strands. Every product they can form with each other is reported, so you don't need Fwd/Rev names for genotyping primer sets.
 - **Optional genome-wide check** (`--genome-check`) searches the whole genome for off-target products, similar to UCSC In-Silico PCR.
+- **Optional suggestions** (`--suggest`): for pairs that don't span an intron or have a problem, it proposes better pairs from Harvard PrimerBank and new Primer3 designs. Each one is checked exactly like your own primers.
 
 ## Requirements
 
@@ -30,6 +31,7 @@ To put the environment somewhere else, set `PRIMER_TOOL_VENV=/path/to/venv` for 
 ./check_primers                               # prompts for the file
 ./check_primers primers.xlsx -o results.xlsx  # custom output name
 ./check_primers primers.xlsx --genome-check   # + genome-wide off-target search
+./check_primers primers.xlsx --suggest        # + suggest better primers where needed
 ./check_primers primers.xlsx --organism "Rattus norvegicus"
 ```
 
@@ -47,8 +49,10 @@ The wrapper works from any directory (e.g. `~/Dropbox/git-repos/primer_validatio
 | `--flank` | 1000 | bp either side of the gene included in its genomic region |
 | `--genome-check` | off | Genome-wide off-target search. The first run downloads the genome (~800 MB for mouse) |
 | `--genome-db` | from organism | UCSC assembly (`mm39`, `rn7`, `hg38`, `danRer11`, `galGal6`, `dm6`) |
+| `--suggest` | off | Suggest alternative pairs (see below) |
+| `--suggest-count` | 3 | Alternatives per pair |
 | `--sheet` | first sheet | Worksheet to read |
-| `--refresh` | off | Re-download NCBI gene data instead of using the cache |
+| `--refresh` | off | Re-download NCBI gene and PrimerBank data instead of using the cache |
 | `--cache-dir` | `~/.cache/primer_validation_tool` | Where NCBI data and genome files are cached |
 
 Environment variables:
@@ -85,9 +89,29 @@ If a gene name isn't found, the script tries swapping neighbouring letters and N
 
 Genes whose names merely start with "Chr" (`Chrm1`, `Chrna7`, `Chrd`) are treated as genes; only an exact chromosome token (`Chr1`, `chrX`, `ChrMT`) counts as a chromosome locus. A primer that still has no partner is listed on the **Primers** sheet with where it binds.
 
+## Suggesting better primers
+
+With `--suggest`, the tool looks for replacements for any gene pair that doesn't span an intron (genomic DNA gives a product), or that gets WARN or FAIL. Pairs matched only because they sit on neighbouring rows with different names, such as promoter/enhancer genotyping primers, are left alone.
+
+Candidates come from two places:
+
+- **[Harvard PrimerBank](https://pga.mgh.harvard.edu/primerbank/)**: published qPCR pairs for mouse and human genes. Some were tested in the lab, and these are marked *lab-validated*.
+- **Primer3 designs**: pairs designed around each exon junction of the transcript your primers target. Either one primer crosses an exon–exon junction (so it can't prime genomic DNA), or the primers sit either side of an intron longer than `--max-product`. The design rules are typical SYBR qPCR ones: 18–25 nt, Tm 58–63 °C within 2 °C of each other, GC 40–60%, no runs over 4 bases, and a product inside your `--min-size`/`--max-size` window.
+
+Every candidate goes through the same checks as your primers: all transcripts, the genomic region, and the genome with `--genome-check`. Only those that **PASS with no genomic DNA product** are offered. They're ranked by:
+1. most isoforms amplified;
+2. lab-validated PrimerBank pairs;
+3. junction-crossing over intron-flanking;
+4. PrimerBank over new designs;
+5. Primer3's quality score.
+
+Options never share a primer position, so you get genuinely different assays. Genes with few exons may get fewer than three.
+
+Primer3 designs are predictions and haven't been tested. Check them by melt curve and gel before you rely on them.
+
 ## Output
 
-An Excel file with three sheets. By default it is saved next to the input file as `<input>_validation_results.xlsx`, whichever directory you run the script from. `-o` overrides this; a relative `-o` path is relative to your current directory.
+An Excel file with three sheets, plus an Alternatives sheet with `--suggest`. By default it is saved next to the input file as `<input>_validation_results.xlsx`, whichever directory you run the script from. `-o` overrides this; a relative `-o` path is relative to your current directory.
 
 ### Pairs
 
@@ -105,6 +129,15 @@ An Excel file with three sheets. By default it is saved next to the input file a
 | **Genome_Products** | With `--genome-check`: on-target / off-target products and locations |
 | **Fwd/Rev_Primer, _Length, _GC%, _Tm_C** | Primer properties |
 | **Fwd/Rev_Mismatches** | Mismatches at the sites used for the product |
+
+### Alternatives
+
+Only with `--suggest`. It has one row per suggested pair:
+- **For_Pair** and **Reason**: the pair being replaced, and why.
+- **Rank** and **Source**: PrimerBank ID (marked *lab-validated* where tested), or Primer3 design.
+- **Intron**: which junction a primer crosses, or which intron the pair spans.
+- **Amplicon size**, **transcripts amplified**, and **genome products** (with `--genome-check`).
+- **Primer sequences**, **Tm** and **GC%**.
 
 ### Primers
 

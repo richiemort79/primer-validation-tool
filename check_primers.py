@@ -19,6 +19,7 @@ Usage:
 
 import argparse
 import gzip
+import html
 import json
 import os
 import re
@@ -1076,6 +1077,294 @@ def inferred_rows(group_ids, primers, genome_sites, names, opts, existing_pairs,
 
 
 # --------------------------------------------------------------------------
+# Alternative primers (--suggest)
+# --------------------------------------------------------------------------
+
+PRIMERBANK_URL = 'https://pga.mgh.harvard.edu/cgi-bin/primerbank/new_search2.cgi'
+PRIMERBANK_SPECIES = {'mus musculus': 'Mouse', 'homo sapiens': 'Human'}
+
+# Typical SYBR qPCR design rules (similar to Primer-BLAST / PrimerBank)
+PRIMER3_SETTINGS = {
+    'PRIMER_OPT_SIZE': 20, 'PRIMER_MIN_SIZE': 18, 'PRIMER_MAX_SIZE': 25,
+    'PRIMER_OPT_TM': 60.0, 'PRIMER_MIN_TM': 58.0, 'PRIMER_MAX_TM': 63.0,
+    'PRIMER_PAIR_MAX_DIFF_TM': 2.0,
+    'PRIMER_MIN_GC': 40.0, 'PRIMER_MAX_GC': 60.0, 'PRIMER_MAX_POLY_X': 4,
+    # A junction-spanning primer needs at least this much on each side
+    'PRIMER_MIN_3_PRIME_OVERLAP_OF_JUNCTION': 4,
+    'PRIMER_MIN_5_PRIME_OVERLAP_OF_JUNCTION': 7,
+}
+
+
+@dataclass
+class Candidate:
+    fwd: str
+    rev: str
+    source: str             # 'PrimerBank' or 'Primer3'
+    source_id: str = ''
+    validated: bool = False  # PrimerBank pair with experimental validation data
+    penalty: float = 0.0     # Primer3 pair penalty (lower is better)
+
+    @property
+    def label(self):
+        if self.source == 'PrimerBank':
+            return f"PrimerBank {self.source_id}{' (lab-validated)' if self.validated else ''}"
+        return 'Primer3 design'
+
+
+def map_exons(transcript, genomic, seed=20, min_intron=30):
+    """
+    Exon blocks of a transcript on its gene's genomic region (both in gene
+    orientation), as [transcript start, transcript end, genomic start].
+    Exact seed-and-extend; gaps shorter than min_intron (SNPs, small
+    differences between the RefSeq mRNA and the genome) are merged.
+    """
+    exons, t, g_from = [], 0, 0
+    while t <= len(transcript) - seed:
+        pos = genomic.find(transcript[t:t + seed], g_from)
+        if pos == -1:
+            t += 5
+            continue
+        k = seed
+        while (t + k < len(transcript) and pos + k < len(genomic)
+               and transcript[t + k] == genomic[pos + k]):
+            k += 1
+        exons.append([t, t + k, pos])
+        t += k
+        g_from = pos + k
+    merged = []
+    for e in exons:
+        if merged:
+            prev = merged[-1]
+            intron = e[2] - (prev[2] + prev[1] - prev[0]) - (e[0] - prev[1])
+            if intron < min_intron:
+                prev[1] = e[1]
+                continue
+        merged.append(e)
+    return merged
+
+
+def exon_junctions(exons):
+    """[(position in transcript, intron length)] between consecutive exons"""
+    return [(b[0], b[2] - (a[2] + a[1] - a[0])) for a, b in zip(exons, exons[1:])]
+
+
+def fetch_primerbank(symbol, organism, cache_dir=None, refresh=False):
+    """
+    Pre-designed qPCR pairs for a gene from Harvard PrimerBank (mouse/human).
+    Returns (candidates, error message or None).
+    """
+    species = PRIMERBANK_SPECIES.get(organism.lower())
+    if not species:
+        return [], None
+    cache_file = Path(cache_dir) / 'primerbank' / species / f'{symbol.lower()}.json' if cache_dir else None
+    if cache_file and cache_file.exists() and not refresh:
+        return [Candidate(**c) for c in json.loads(cache_file.read_text())], None
+    try:
+        r = requests.post(PRIMERBANK_URL, timeout=60, data={
+            'selectBox': 'NCBI Gene Symbol', 'species': species, 'searchBox': symbol, 'Submit': 'Submit'})
+        r.raise_for_status()
+    except requests.RequestException as e:
+        return [], f'PrimerBank lookup failed: {e}'
+
+    text = html.unescape(re.sub(r'<[^>]+>', '\n', r.text))
+    tokens = [t.strip() for t in text.splitlines() if t.strip()]
+    candidates, block = [], None
+    for tok in tokens + ['Primer Pair END']:
+        if tok.startswith('Primer Pair '):
+            if block:
+                def after(label):
+                    i = block.index(label) + 1 if label in block else None
+                    return block[i] if i is not None and i < len(block) else ''
+                fwd, rev = clean_sequence(after('Forward Primer')), clean_sequence(after('Reverse Primer'))
+                if fwd and rev and not invalid_bases(fwd + rev):
+                    candidates.append(Candidate(fwd, rev, 'PrimerBank', after('PrimerBank ID'),
+                                                any(t.startswith('Validation Results') for t in block)))
+            block = []
+        elif block is not None:
+            block.append(tok)
+    if cache_file:
+        cache_file.parent.mkdir(parents=True, exist_ok=True)
+        cache_file.write_text(json.dumps([c.__dict__ for c in candidates]))
+    return candidates, None
+
+
+def design_primer3(template, junctions, opts, per_junction=3, per_intron=2):
+    """
+    Design qPCR pairs on a transcript with Primer3, around every exon
+    junction separately (so the options are spread along the transcript),
+    two ways: a primer crossing the junction (cannot prime genomic DNA), and
+    primers either side of the intron.
+    """
+    if primer3 is None:
+        return []
+    settings = dict(PRIMER3_SETTINGS, PRIMER_PRODUCT_SIZE_RANGE=[[opts.min_size, opts.max_size]])
+    runs = []
+    for j, intron in junctions:
+        runs.append(({'SEQUENCE_OVERLAP_JUNCTION_LIST': [j]}, per_junction))
+        # Flanking only helps if the genomic product would be too long to amplify
+        if intron + opts.min_size > opts.max_product:
+            runs.append(({'SEQUENCE_TARGET': [max(j - 1, 0), 2]}, per_intron))
+    candidates = []
+    for extra, n in runs:
+        try:
+            out = primer3.bindings.design_primers(
+                dict({'SEQUENCE_ID': 'target', 'SEQUENCE_TEMPLATE': template}, **extra),
+                dict(settings, PRIMER_NUM_RETURN=n))
+        except Exception:
+            continue
+        for i in range(out.get('PRIMER_PAIR_NUM_RETURNED', 0)):
+            candidates.append(Candidate(out[f'PRIMER_LEFT_{i}_SEQUENCE'], out[f'PRIMER_RIGHT_{i}_SEQUENCE'],
+                                        'Primer3', penalty=out[f'PRIMER_PAIR_{i}_PENALTY']))
+    return candidates
+
+
+def intron_spanning(fwd, rev, template, exons, opts):
+    """
+    How a pair relates to the transcript's exon structure, as (kind, text, product):
+    kind 0 = a primer crosses an exon junction, 1 = the product spans an intron,
+    2 = the product is within one exon, 3 = no product on the transcript.
+    """
+    ev = evaluate_on_sequence(fwd, rev, template, opts.max_mismatches, opts.exact_3prime, opts.max_product)
+    if not ev.products:
+        return 3, 'No product on the design transcript', None
+    p = ev.products[0]
+    junctions = exon_junctions(exons)
+    for site in (p.left, p.right):
+        which = 'Fwd' if site.primer == 'F' else 'Rev'
+        for k, (j, _) in enumerate(junctions):
+            if site.start < j < site.end:
+                return 0, f'{which} primer crosses the exon {k + 1}/{k + 2} junction', p
+    for k, (j, intron) in enumerate(junctions):
+        if p.left.start < j < p.right.end:
+            return 1, f'Primers in exons {k + 1} and {k + 2}, either side of a {intron:,} bp intron', p
+    return 2, 'Both primers in the same exon', p
+
+
+def suggestion_reason(row):
+    """Why alternatives are being suggested for a pair"""
+    if row['Status'] in ('WARN', 'FAIL') and row['Problem']:
+        return format_problems(row['Problem'])
+    if pd.notna(row.get('Genomic_Amplicon_bp')):
+        return f"Does not span an intron (genomic DNA gives a {int(row['Genomic_Amplicon_bp'])} bp product)"
+    return ''
+
+
+def needs_alternatives(row):
+    return row['Status'] in ('WARN', 'FAIL') or pd.notna(row.get('Genomic_Amplicon_bp'))
+
+
+def suggest_alternatives(jobs, opts, db):
+    """
+    For each (pair, gene, row) whose primers have a problem or don't span an
+    intron, gather PrimerBank and Primer3 candidates, check each one exactly
+    as the original pairs are checked, and return the best as rows.
+    """
+    prepared = []
+    for pair, gene, row in jobs:
+        acc = (row['Matched_Transcripts'].split(' ')[0] if row['Matched_Transcripts']
+               else next((a for a, _ in gene.transcripts if a.startswith('NM_')),
+                         gene.transcripts[0][0] if gene.transcripts else None))
+        template = dict(gene.transcripts).get(acc)
+        exons = map_exons(template, gene.genomic) if template and gene.genomic else []
+        bank, bank_error = fetch_primerbank(gene.symbol, opts.organism, opts.cache_dir, opts.refresh)
+        designed = design_primer3(template, exon_junctions(exons), opts) if template else []
+        seen, candidates = {(pair.fwd.seq, pair.rev.seq)}, []
+        for c in bank + designed:
+            if (c.fwd, c.rev) not in seen:
+                seen.add((c.fwd, c.rev))
+                candidates.append(c)
+        prepared.append((pair, gene, row, acc, template, exons, candidates, bank_error))
+
+    # One genome scan for every candidate primer, if requested
+    cand_primers, index = [], {}
+    for *_, candidates, _ in prepared:
+        for c in candidates:
+            for seq in (c.fwd, c.rev):
+                if seq not in index:
+                    index[seq] = len(cand_primers)
+                    cand_primers.append(Primer(f'candidate{len(cand_primers)}', seq, 0))
+    sites, saturated = {}, set()
+    if opts.genome_check and cand_primers and db:
+        print(f"\n  Searching {len(cand_primers)} candidate primers on {db} for off-target products")
+        try:
+            sites, saturated = scan_genome(cand_primers, genome_chromosomes(db, opts.cache_dir), db,
+                                           opts.cache_dir, opts.max_mismatches, opts.anchor)
+        except Exception as e:
+            print(f'  ❌ Genome search failed: {e}')
+            sites = None
+
+    rows = []
+    for pair, gene, row, acc, template, exons, candidates, bank_error in prepared:
+        print(f"\n{pair.fwd.name} + {pair.rev.name}: {suggestion_reason(row)}")
+        if bank_error:
+            print(f'  ⚠ {bank_error}')
+        scored = []
+        for c in candidates:
+            f, r = Primer(f'{gene.symbol}_alt_Fwd', c.fwd, 0), Primer(f'{gene.symbol}_alt_Rev', c.rev, 0)
+            f.stats, r.stats = calculate_primer_stats(c.fwd), calculate_primer_stats(r.seq)
+            genome = None
+            if opts.genome_check and sites is not None and sites:
+                fi, ri = index[c.fwd], index[c.rev]
+                genome = (genome_products([fi, ri], sites, opts.max_product),
+                          {fi: f.name, ri: r.name}, {fi, ri} & saturated)
+            res = evaluate_gene_pair(f, r, gene, opts, genome)
+            kind, how, product = (intron_spanning(c.fwd, c.rev, template, exons, opts)
+                                  if template else (3, '', None))
+            # Only offer pairs that fix the problem: no warnings at all, and
+            # genomic DNA can't give a product
+            if res['Status'] != 'PASS' or kind >= 2 or pd.notna(res['Genomic_Amplicon_bp']):
+                continue
+            amplified, total = (int(x) for x in res['Transcripts_Amplified'].split('/'))
+            # Most isoforms covered first, then lab-validated PrimerBank pairs,
+            # junction-crossing over intron-flanking, PrimerBank over new
+            # designs, lower Primer3 penalty
+            key = (-(amplified / total if total else 0), not c.validated, kind,
+                   c.source != 'PrimerBank', c.penalty)
+            scored.append((key, c, res, how, product))
+        scored.sort(key=lambda x: x[0])
+
+        chosen, taken = [], []
+        for key, c, res, how, product in scored:
+            # Offer genuinely different options: no primer overlapping (by 10+
+            # bases) a primer already chosen, so not one assay shifted by a base
+            spans = [(product.left.start, product.left.end), (product.right.start, product.right.end)]
+            if any(min(e1, e2) - max(s1, s2) >= 10 for s1, e1 in spans for s2, e2 in taken):
+                continue
+            chosen.append((c, res, how))
+            taken.extend(spans)
+            if len(chosen) == opts.suggest_count:
+                break
+        if not chosen:
+            print('  No alternative found that passes cleanly and avoids genomic DNA')
+        for rank, (c, res, how) in enumerate(chosen, 1):
+            print(f"  {rank}. {c.label}: {res['Amplicon_Size_bp']} bp, {how}, "
+                  f"amplifies {res['Transcripts_Amplified']} transcripts"
+                  + (f" ⚠ {format_problems(res['Problem'])}" if res['Problem'] else ''))
+            print(f'     Fwd {c.fwd}   Rev {c.rev}')
+            rows.append({
+                'For_Pair': f'{pair.fwd.name} + {pair.rev.name}',
+                'Reason': suggestion_reason(row),
+                'Rank': rank,
+                'Source': c.label,
+                'Status': res['Status'],
+                'Problem': format_problems(res['Problem']),
+                'Intron': how,
+                'Amplicon_Size_bp': res['Amplicon_Size_bp'],
+                'Transcripts_Amplified': res['Transcripts_Amplified'],
+                'Design_Transcript': acc,
+                'Genome_Products': res['Genome_Products'],
+                'Fwd_Primer': c.fwd,
+                'Rev_Primer': c.rev,
+                'Fwd_Tm_C': res['Fwd_Tm_C'],
+                'Rev_Tm_C': res['Rev_Tm_C'],
+                'Fwd_GC%': res['Fwd_GC%'],
+                'Rev_GC%': res['Rev_GC%'],
+                'Notes': res['Notes'],
+            })
+    return pd.DataFrame(rows)
+
+
+# --------------------------------------------------------------------------
 # Main workflow
 # --------------------------------------------------------------------------
 
@@ -1121,6 +1410,7 @@ def validate(primers, opts):
     # ---- Pairs
     ncbi = NCBI(os.environ.get('NCBI_API_KEY'), os.environ.get('NCBI_EMAIL'))
     gene_cache = {}
+    suggest_jobs = []
     print(f"\n{'=' * 70}\nValidating {len(pairs)} primer pairs against {opts.organism}\n{'=' * 70}\n")
     for n, pair in enumerate(pairs, 1):
         fwd, rev = pair.fwd, pair.rev
@@ -1149,6 +1439,11 @@ def validate(primers, opts):
                     genome = (genome_products([f_idx, r_idx], genome_sites, opts.max_product),
                               names, {f_idx, r_idx} & saturated)
                 row = evaluate_gene_pair(fwd, rev, gene, opts, genome)
+                # Skip pairs only matched by row position with different names
+                # (e.g. promoter/enhancer genotyping primers): not a gene qPCR assay
+                same_target = pair.how != 'adjacent' or fwd.base.lower() == rev.base.lower()
+                if opts.suggest and same_target and needs_alternatives(row):
+                    suggest_jobs.append((pair, gene, row))
         # Naming problems go first: they are the thing to fix before ordering
         name_problems = [t for t in (warning, pair.note if pair.how == 'typo' else None) if t]
         if name_problems:
@@ -1203,6 +1498,17 @@ def validate(primers, opts):
             p.binding = (describe_sites(genome_sites[i]) or f'no binding site in {db}'
                          if i not in saturated else 'repetitive: too many genome sites')
 
+    alternatives = pd.DataFrame()
+    if suggest_jobs:
+        print(f"\n{'=' * 70}\nSuggesting alternatives for {len(suggest_jobs)} pair"
+              f"{'s' if len(suggest_jobs) > 1 else ''}\n{'=' * 70}")
+        alternatives = suggest_alternatives(suggest_jobs, opts, None if genome_error else db)
+        offered = set(alternatives['For_Pair']) if not alternatives.empty else set()
+        for row in rows:
+            if row['Pair'] in offered:
+                row['Notes'] = '; '.join(t for t in (row['Notes'], 'Alternatives suggested on the '
+                                                     'Alternatives sheet') if t)
+
     for row in rows:
         row['Problem'] = format_problems(row['Problem'])
     pairs_df = pd.DataFrame(rows, columns=list(blank_result(Primer('', '', 0), Primer('', '', 0), '').keys()))
@@ -1221,7 +1527,7 @@ def validate(primers, opts):
         'Tm_C': p.stats.get('tm'),
         'Binding': p.binding,
     } for p in primers])
-    return pairs_df, primers_df, unpaired
+    return pairs_df, primers_df, unpaired, alternatives
 
 
 def print_result(row):
@@ -1268,7 +1574,7 @@ def print_summary(pairs_df, unpaired, opts):
                 print(f"      {row['Problem']}")
 
 
-def write_report(pairs_df, primers_df, output_file, opts):
+def write_report(pairs_df, primers_df, output_file, opts, alternatives=None):
     settings = pd.DataFrame([
         ('Run', datetime.now().strftime('%Y-%m-%d %H:%M')),
         ('Organism', opts.organism),
@@ -1278,13 +1584,20 @@ def write_report(pairs_df, primers_df, output_file, opts):
         ("3' bases that must match (gene check)", opts.exact_3prime),
         ("3' bases that must match (genome search)", opts.anchor),
         ('Genome-wide off-target check', 'yes' if opts.genome_check else 'no'),
+        ('Suggest alternatives', f'yes, up to {opts.suggest_count} per pair' if opts.suggest else 'no'),
+        ('Primer3 design settings', ', '.join(f'{k.replace("PRIMER_", "")}={v}'
+                                              for k, v in PRIMER3_SETTINGS.items())),
         ('Genome assembly', opts.genome_db or UCSC_DBS.get(opts.organism.lower(), '')),
         ('Tm method', 'Primer3 nearest-neighbour (SantaLucia 1998); '
                       '50 mM Na+, 1.5 mM Mg2+, 0.6 mM dNTP, 50 nM oligo'),
     ], columns=['Setting', 'Value'])
 
     with pd.ExcelWriter(output_file, engine='openpyxl') as writer:
-        for name, df in (('Pairs', pairs_df), ('Primers', primers_df), ('Settings', settings)):
+        sheets = [('Pairs', pairs_df)]
+        if alternatives is not None and not alternatives.empty:
+            sheets.append(('Alternatives', alternatives))
+        sheets += [('Primers', primers_df), ('Settings', settings)]
+        for name, df in sheets:
             df.to_excel(writer, index=False, sheet_name=name)
             ws = writer.sheets[name]
             ws.freeze_panes = 'A2'
@@ -1346,7 +1659,12 @@ Environment:
                              '(first run downloads the genome, ~800 MB for mouse)')
     parser.add_argument('--genome-db', help='UCSC assembly to use (default: from --organism, e.g. mm39)')
     parser.add_argument('--cache-dir', default=str(DEFAULT_CACHE), help=f'Cache directory (default {DEFAULT_CACHE})')
-    parser.add_argument('--refresh', action='store_true', help='Ignore cached NCBI gene data')
+    parser.add_argument('--refresh', action='store_true', help='Ignore cached NCBI gene and PrimerBank data')
+    parser.add_argument('--suggest', action='store_true',
+                        help="For pairs that don't span an intron or have a problem, suggest better "
+                             'pairs (PrimerBank, then Primer3 designs), each checked like your own')
+    parser.add_argument('--suggest-count', type=int, default=3,
+                        help='Alternatives to suggest per pair (default 3)')
     return parser
 
 
@@ -1369,12 +1687,13 @@ def main():
         print("\n❌ No primer sequences found (expected 'Name' and 'Sequence' columns)")
         sys.exit(1)
 
-    pairs_df, primers_df, unpaired = validate(primers, opts)
+    pairs_df, primers_df, unpaired, alternatives = validate(primers, opts)
     print_summary(pairs_df, unpaired, opts)
 
     print(f"\n{'=' * 70}\nSaving results to: {output_file}")
-    write_report(pairs_df, primers_df, output_file, opts)
-    print(f"✓ Results saved (sheets: Pairs, Primers, Settings)\n{'=' * 70}\n")
+    write_report(pairs_df, primers_df, output_file, opts, alternatives)
+    sheets = 'Pairs, ' + ('Alternatives, ' if not alternatives.empty else '') + 'Primers, Settings'
+    print(f"✓ Results saved (sheets: {sheets})\n{'=' * 70}\n")
 
 
 if __name__ == "__main__":
