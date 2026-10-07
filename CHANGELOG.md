@@ -1,5 +1,13 @@
 # Changelog
 
+## Version 2.1.0 (2026-10-07)
+
+### Pairing
+- Direction word can sit anywhere in the name, e.g. `Mitf_Fwd_IM` (previously these all came out unpaired)
+- Unpaired Fwd/Rev primers on neighbouring rows are paired (order sheets list pairs on alternate lines)
+- Near-identical names are paired as a probable typo (`Tyrp1_Fwd_IM` + `Tryp1_Rev_IM`) and flagged WARN
+- Gene names not found in NCBI are retried with neighbouring letters swapped and NCBI's spelling suggestion (`Endrb` -> Ednrb); only official symbols are accepted, and the pair is flagged WARN
+
 ## Version 2.0.0 (2026-10-07)
 
 ### Bug fixes

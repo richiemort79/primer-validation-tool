@@ -62,19 +62,28 @@ Use an Excel order template (IDT/Sigma) or a CSV. The script finds the header ro
 
 Inline modification codes (`/5Phos/`, `[Btn]`), whitespace and lower case are cleaned up. Degenerate IUPAC bases (N, R, Y…) are supported. Any other character marks the primer as invalid.
 
-### Naming
+### Naming and pairing
 
-Primers are paired by name. The direction suffix needs a separator (`_`, `-`, `.` or space) and is case-insensitive:
+Each name is split into words on `_`, `-`, `.` or spaces. A direction word (`Fwd`, `For`, `Forward`, `Rev`, `Reverse`, case-insensitive, optionally numbered like `Fwd2`) can appear anywhere after the gene name. A single letter `F`/`R` only counts at the very end, so `Chr1_R_Flank` isn't read as a reverse primer.
 
 | Name | Read as |
 |------|---------|
 | `Mitf_Fwd`, `Mitf_For`, `Mitf_F`, `Mitf_Forward` | forward primer for gene *Mitf* |
 | `Mitf_Rev`, `Mitf_R`, `Mitf_reverse` | reverse primer for gene *Mitf* |
+| `Mitf_Fwd_IM` + `Mitf_Rev_IM` | *Mitf* pair with tag `IM` (tags after the direction are fine) |
 | `Gapdh_F1` + `Gapdh_R1`, `Gapdh_F2` + `Gapdh_R2` | two separate *Gapdh* pairs |
 | `Tyr_Pro_For` | forward primer, looked up as `Tyr_Pro`, then `Tyr` |
 | `Chr1_L_Flank`, `Chr1_R_Int` | chromosome 1 locus primers. Products are inferred between them |
 
-Genes whose names merely start with "Chr" (`Chrm1`, `Chrna7`, `Chrd`) are treated as genes; only an exact chromosome token (`Chr1`, `chrX`, `ChrMT`) counts as a chromosome locus. A primer without a named partner is listed on the **Primers** sheet with where it binds.
+Primers are paired in this order:
+
+1. **Same name** apart from the direction (`Mitf_Fwd_IM` + `Mitf_Rev_IM`).
+2. **Neighbouring rows**: an unpaired Fwd directly above or below an unpaired Rev, as order sheets usually list pairs on alternate lines (`Cre_For` + `ERT_Rev`). This is noted in *Details*.
+3. **Near-identical names** anywhere in the sheet (`Tyrp1_Fwd` + `Tryp1_Rev`). This is reported as a probable typo, and the pair is marked WARN so you fix the name before ordering.
+
+If a gene name isn't found, the script tries swapping neighbouring letters and NCBI's spelling suggestion (`Endrb` → *Ednrb*). It only accepts a suggestion that is an official symbol. The pair is then checked against that gene and marked WARN.
+
+Genes whose names merely start with "Chr" (`Chrm1`, `Chrna7`, `Chrd`) are treated as genes; only an exact chromosome token (`Chr1`, `chrX`, `ChrMT`) counts as a chromosome locus. A primer that still has no partner is listed on the **Primers** sheet with where it binds.
 
 ## Output
 
@@ -130,7 +139,8 @@ For **chromosome-locus** pairs the qPCR size window isn't applied. They PASS if 
 
 ## Troubleshooting
 
-- **"No Mus musculus gene named …"**: use the official gene symbol as the primer name prefix (`Gapdh_Fwd`, not `GAPDH-mouse_Fwd`).
+- **"No Mus musculus gene named …"**: use the official gene symbol as the first part of the primer name (`Gapdh_Fwd`, not `GAPDH-mouse_Fwd`).
+- **Primers listed as "without a Fwd/Rev partner"**: give them matching names with Fwd/Rev, or put each Fwd on the row directly above its Rev.
 - **"NCBI request failed"**: a network or NCBI outage. Re-run; successfully fetched genes are cached.
 - **Slow first `--genome-check`**: the genome is downloading into the cache directory. Later runs take about a minute.
 

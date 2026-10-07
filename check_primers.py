@@ -66,11 +66,14 @@ UCSC_DBS = {
 }
 UCSC_DOWNLOAD = 'https://hgdownload.soe.ucsc.edu/goldenPath'
 
-# "Gene_Fwd", "Gene-rev", "Gene_F1", "Gene_Reverse2" ... (case-insensitive).
-# A separator is required so gene names ending in f/r are not split.
-DIRECTION_RE = re.compile(
-    r'^(?P<base>.+?)[_\-\s.](?P<dir>fwd|for|forward|f|rev|reverse|r)(?P<num>\d*)$',
-    re.IGNORECASE)
+# Primer names are split into tokens on _ - . or space. A direction word
+# (Fwd/For/Forward/Rev/Reverse, optionally numbered: Fwd2) may be any token
+# after the first, so "Mitf_Fwd_IM" works; a single letter F/R (optionally
+# numbered: F1) only counts as the last token, so "Chr1_R_Flank" is not
+# read as a reverse primer.
+NAME_SEP_RE = re.compile(r'([_\-\s.]+)')
+DIRECTION_WORD_RE = re.compile(r'(?P<dir>fwd|for|forward|rev|reverse)(?P<num>\d*)', re.IGNORECASE)
+DIRECTION_LETTER_RE = re.compile(r'(?P<dir>[fr])(?P<num>\d*)', re.IGNORECASE)
 # Only an exact chromosome token counts, so genes such as Chrm1, Chrna7 or
 # Chrd are still treated as genes.
 CHROM_RE = re.compile(r'^chr(?P<chrom>\d+|X|Y|M|MT)$', re.IGNORECASE)
@@ -272,6 +275,7 @@ class Primer:
     base: str = ''
     direction: str = None   # 'F', 'R' or None
     pair_num: str = ''
+    tag: str = ''           # text after the direction, e.g. 'IM' in Mitf_Fwd_IM
     chrom: str = None       # e.g. 'chr1' for Chr1_* locus primers
     stats: dict = field(default_factory=dict)
     error: str = None
@@ -280,7 +284,7 @@ class Primer:
 
     @property
     def pair_key(self):
-        return (self.base.lower(), self.pair_num)
+        return (self.base.lower(), self.pair_num, self.tag.lower())
 
     @property
     def label(self):
@@ -289,16 +293,49 @@ class Primer:
 
 def parse_primer_name(name):
     """
-    Split a primer name into (base, direction, pair number).
-    'Gapdh_Fwd' -> ('Gapdh', 'F', ''); 'Gapdh_R2' -> ('Gapdh', 'R', '2');
-    'Chr1_L_Flank' -> ('Chr1_L_Flank', None, '')
+    Split a primer name into (base, direction, pair number, tag).
+    'Gapdh_Fwd' -> ('Gapdh', 'F', '', ''); 'Gapdh_R2' -> ('Gapdh', 'R', '2', '');
+    'Mitf_Fwd_IM' -> ('Mitf', 'F', '', 'IM');
+    'Chr1_L_Flank' -> ('Chr1_L_Flank', None, '', '')
     """
     name = str(name).strip()
-    m = DIRECTION_RE.match(name)
-    if not m:
-        return name, None, ''
+    parts = NAME_SEP_RE.split(name)   # tokens at even indexes, separators between
+    tokens = parts[0::2]
+    found = None
+    for k in range(len(tokens) - 1, 0, -1):
+        m = DIRECTION_WORD_RE.fullmatch(tokens[k])
+        if m:
+            found = (k, m)
+            break
+    if found is None and len(tokens) > 1:
+        m = DIRECTION_LETTER_RE.fullmatch(tokens[-1])
+        if m:
+            found = (len(tokens) - 1, m)
+    if found is None:
+        return name, None, '', ''
+    k, m = found
+    base = ''.join(parts[:2 * k - 1])
+    tag = ''.join(parts[2 * k + 2:])
     direction = 'F' if m['dir'].lower().startswith('f') else 'R'
-    return m['base'], direction, m['num']
+    return base, direction, m['num'], tag
+
+
+def name_distance(a, b):
+    """Edit distance counting a swap of neighbouring letters as one edit"""
+    a, b = a.lower(), b.lower()
+    d = [[max(i, j) if min(i, j) == 0 else 0 for j in range(len(b) + 1)] for i in range(len(a) + 1)]
+    for i in range(1, len(a) + 1):
+        for j in range(1, len(b) + 1):
+            cost = a[i - 1] != b[j - 1]
+            d[i][j] = min(d[i - 1][j] + 1, d[i][j - 1] + 1, d[i - 1][j - 1] + cost)
+            if i > 1 and j > 1 and a[i - 1] == b[j - 2] and a[i - 2] == b[j - 1]:
+                d[i][j] = min(d[i][j], d[i - 2][j - 2] + 1)
+    return d[len(a)][len(b)]
+
+
+def probable_typo(a, b):
+    """Two different base names that are probably the same name mistyped"""
+    return a.lower() != b.lower() and min(len(a), len(b)) >= 4 and name_distance(a, b) <= 2
 
 
 def chromosome_of(base):
@@ -356,9 +393,9 @@ def load_primers(filepath, sheet=None):
             continue  # no header to anchor on: skip rows that aren't DNA
         raw_name = raw.iat[idx, name_col]
         name = str(raw_name).strip() if pd.notna(raw_name) and str(raw_name).strip() else f'Row{idx + 1}'
-        base, direction, num = parse_primer_name(name)
-        primer = Primer(name=name, seq=seq, row=idx + 1, base=base,
-                        direction=direction, pair_num=num, chrom=chromosome_of(base))
+        base, direction, num, tag = parse_primer_name(name)
+        primer = Primer(name=name, seq=seq, row=idx + 1, base=base, direction=direction,
+                        pair_num=num, tag=tag, chrom=chromosome_of(base))
         bad = invalid_bases(seq)
         if bad:
             primer.error = f"Invalid characters in sequence: {''.join(bad)}"
@@ -369,26 +406,68 @@ def load_primers(filepath, sheet=None):
     return primers
 
 
+@dataclass
+class PrimerPair:
+    fwd: Primer
+    rev: Primer
+    how: str = 'name'   # 'name', 'adjacent' (neighbouring rows) or 'typo'
+    note: str = ''
+
+
 def pair_primers(primers):
     """
-    Group primers into fwd/rev pairs by base name (and optional pair number).
-    Returns (pairs, unpaired). Groups with several fwd or rev primers give
-    every fwd x rev combination.
+    Pair forward and reverse primers. Returns (pairs, unpaired).
+      1. Same name apart from the direction (Mitf_Fwd_IM + Mitf_Rev_IM).
+         Groups with several fwd or rev primers give every combination.
+      2. Neighbouring rows holding one Fwd and one Rev (Cre_For + ERT_Rev),
+         as order sheets usually list pairs on alternate lines.
+      3. Names that differ by a likely typo (Tyrp1_Fwd + Tryp1_Rev).
+    Only primers whose name has a direction are paired.
     """
+    pairs = []
+
+    def link(f, r, how='name', note=''):
+        pairs.append(PrimerPair(f, r, how, note))
+        f.paired_with.append(r.name)
+        r.paired_with.append(f.name)
+
     groups = {}
     for p in primers:
         if p.direction:
             groups.setdefault(p.pair_key, []).append(p)
-
-    pairs = []
     for members in groups.values():
-        fwds = [p for p in members if p.direction == 'F']
-        revs = [p for p in members if p.direction == 'R']
-        for f in fwds:
-            for r in revs:
-                pairs.append((f, r))
-                f.paired_with.append(r.name)
-                r.paired_with.append(f.name)
+        for f in (p for p in members if p.direction == 'F'):
+            for r in (p for p in members if p.direction == 'R'):
+                link(f, r)
+
+    def free(p):
+        return p.direction and not p.paired_with
+
+    i = 0
+    while i < len(primers) - 1:
+        a, b = primers[i], primers[i + 1]
+        if free(a) and free(b) and {a.direction, b.direction} == {'F', 'R'}:
+            f, r = (a, b) if a.direction == 'F' else (b, a)
+            if probable_typo(f.base, r.base):
+                link(f, r, 'typo', f"Names don't match ('{f.base}' vs '{r.base}'): "
+                                   f"probable typo, paired as neighbouring rows")
+            elif f.base.lower() == r.base.lower():
+                link(f, r, 'adjacent', 'Paired as neighbouring rows (name suffixes differ)')
+            else:
+                link(f, r, 'adjacent', f"Paired as neighbouring rows (names differ: "
+                                       f"'{f.base}' vs '{r.base}')")
+            i += 2
+        else:
+            i += 1
+
+    for f in [p for p in primers if free(p) and p.direction == 'F']:
+        candidates = [r for r in primers if free(r) and r.direction == 'R'
+                      and (r.pair_num, r.tag.lower()) == (f.pair_num, f.tag.lower())
+                      and probable_typo(f.base, r.base)]
+        if candidates:
+            r = min(candidates, key=lambda r: name_distance(f.base, r.base))
+            link(f, r, 'typo', f"Names don't match ('{f.base}' vs '{r.base}'): probable typo")
+
     unpaired = [p for p in primers if not p.paired_with]
     return pairs, unpaired
 
@@ -562,11 +641,52 @@ def fetch_gene(ncbi, symbol, organism, flank=1000, cache_dir=None, refresh=False
     return record
 
 
-def resolve_gene(ncbi, base, organism, gene_cache, opts):
-    """Look up the gene for a primer base name, trying fallbacks; memoised.
-    Returns (GeneRecord or None, error message or None)."""
-    errors = []
-    for symbol in gene_symbol_candidates(base):
+def spelling_suggestions(ncbi, symbol, organism):
+    """
+    Likely intended gene symbols for a misspelt one: any real gene that is
+    the name with two neighbouring letters swapped (Endrb -> Ednrb), then
+    NCBI's spelling suggestion (which is sometimes flaky or far off).
+    """
+    swaps = _transposed_symbols(ncbi, symbol, organism)
+    try:
+        text = ncbi.request('espell.fcgi', db='gene', term=symbol).text
+        m = re.search(r'<CorrectedQuery>([^<]*)</CorrectedQuery>', text)
+        suggestion = m.group(1).strip() if m else ''
+        if suggestion and suggestion.lower() != symbol.lower() and re.fullmatch(r'[\w\-.]+', suggestion):
+            return swaps + [suggestion]
+    except NCBIError:
+        pass
+    return swaps
+
+
+def _transposed_symbols(ncbi, symbol, organism):
+    """Real gene symbols equal to `symbol` with two neighbouring letters swapped"""
+    variants = {symbol[:i] + symbol[i + 1] + symbol[i] + symbol[i + 2:]
+                for i in range(len(symbol) - 1)} - {symbol}
+    if not variants:
+        return []
+    term = ('(' + ' OR '.join(f'"{v}"[Gene Name]' for v in sorted(variants))
+            + f') AND "{organism}"[Organism] AND alive[prop]')
+    try:
+        ids = ncbi.json('esearch.fcgi', db='gene', retmax=20, term=term)['esearchresult'].get('idlist', [])
+        if not ids:
+            return []
+        summary = ncbi.json('esummary.fcgi', db='gene', id=','.join(ids))['result']
+    except NCBIError:
+        return []
+    wanted = {v.lower() for v in variants}
+    names = [summary[i].get('name', '') for i in summary.get('uids', [])]
+    return [n for n in names if n.lower() in wanted]
+
+
+def resolve_gene(ncbi, bases, organism, gene_cache, opts):
+    """
+    Look up the gene for a primer pair's base name(s), trying each name, then
+    its first token, then NCBI's spelling suggestion; memoised.
+    Returns (GeneRecord or None, error message or None, warning or None).
+    A warning is returned when the gene was only found via a spelling suggestion.
+    """
+    def lookup(symbol):
         key = symbol.lower()
         if key not in gene_cache:
             try:
@@ -574,18 +694,35 @@ def resolve_gene(ncbi, base, organism, gene_cache, opts):
                                               opts.cache_dir, opts.refresh), None)
             except NCBIError as e:
                 gene_cache[key] = (None, f'NCBI request failed: {e}')
-        gene, err = gene_cache[key]
-        if gene:
-            if symbol != base:
-                note = f"looked up as '{symbol}'"
-                gene = replace(gene, note=f'{gene.note}; {note}' if gene.note else note)
-            return gene, None
-        if err:
-            errors.append(err)
+        return gene_cache[key]
+
+    errors = []
+    for base in bases:
+        for symbol in gene_symbol_candidates(base):
+            gene, err = lookup(symbol)
+            if gene:
+                if symbol != base:
+                    note = f"looked up as '{symbol}'"
+                    gene = replace(gene, note=f'{gene.note}; {note}' if gene.note else note)
+                return gene, None, None
+            if err:
+                errors.append(err)
     if errors:
-        return None, errors[0]
-    tried = "' / '".join(gene_symbol_candidates(base))
-    return None, f"No {organism} gene named '{tried}' in NCBI Gene"
+        return None, errors[0], None
+
+    for base in bases:
+        for symbol in gene_symbol_candidates(base):
+            for suggestion in spelling_suggestions(ncbi, symbol, organism):
+                gene, _ = lookup(suggestion)
+                # Only an official symbol: a suggestion that is merely an alias
+                # (tryp -> Prss2) is too likely to be the wrong gene
+                if gene and gene.symbol.lower() == suggestion.lower():
+                    return gene, None, (f"No gene named '{symbol}'; checked against NCBI's "
+                                        f"spelling suggestion {gene.symbol} (fix the name if that "
+                                        f"is the intended gene)")
+
+    tried = "' / '".join(c for b in bases for c in gene_symbol_candidates(b))
+    return None, f"No {organism} gene named '{tried}' in NCBI Gene", None
 
 
 # --------------------------------------------------------------------------
@@ -958,20 +1095,24 @@ def validate(primers, opts):
     ncbi = NCBI(os.environ.get('NCBI_API_KEY'), os.environ.get('NCBI_EMAIL'))
     gene_cache = {}
     print(f"\n{'=' * 70}\nValidating {len(pairs)} primer pairs against {opts.organism}\n{'=' * 70}\n")
-    for n, (fwd, rev) in enumerate(pairs, 1):
+    for n, pair in enumerate(pairs, 1):
+        fwd, rev = pair.fwd, pair.rev
         f_idx, r_idx = index[id(fwd)], index[id(rev)]
         print(f'[{n}/{len(pairs)}] {fwd.name} + {rev.name}')
+        warning = None
         if fwd.error or rev.error:
             row = blank_result(fwd, rev, fwd.label)
             row.update(Status='ERROR', Details='; '.join(e for e in (fwd.error, rev.error) if e))
-        elif fwd.chrom:
+        elif fwd.chrom and rev.chrom:
             if genome_error or db is None:
                 row = blank_result(fwd, rev, fwd.chrom)
                 row.update(Status='ERROR', Details=genome_error or 'Genome not searched')
             else:
                 row = evaluate_chrom_pair(fwd, rev, f_idx, r_idx, genome_sites, saturated, names, opts)
         else:
-            gene, err = resolve_gene(ncbi, fwd.base, opts.organism, gene_cache, opts)
+            # Only fall back to the reverse primer's name when it looks like a typo
+            bases = [fwd.base] + ([rev.base] if pair.how == 'typo' else [])
+            gene, err, warning = resolve_gene(ncbi, bases, opts.organism, gene_cache, opts)
             if gene is None:
                 row = blank_result(fwd, rev, fwd.label)
                 row.update(Status='ERROR', Details=err)
@@ -981,12 +1122,18 @@ def validate(primers, opts):
                     genome = (genome_products([f_idx, r_idx], genome_sites, opts.max_product),
                               names, {f_idx, r_idx} & saturated)
                 row = evaluate_gene_pair(fwd, rev, gene, opts, genome)
+        flags = [(pair.note, pair.how == 'typo'), (warning, True)]
+        for text, is_warning in reversed(flags):
+            if text:
+                row['Details'] = f"{text}; {row['Details']}" if row['Details'] else text
+                if is_warning and row['Status'] == 'PASS':
+                    row['Status'] = 'WARN'
         symbol = {'PASS': '✓', 'WARN': '⚠', 'FAIL': '✗', 'ERROR': '✗'}[row['Status']]
         print(f"  {symbol} {row['Status']}: {row['Details']}\n")
         rows.append(row)
 
     # ---- Primers without a named partner
-    existing = {frozenset((f.name, r.name)) for f, r in pairs}
+    existing = {frozenset((pair.fwd.name, pair.rev.name)) for pair in pairs}
     chrom_groups = {}
     for p in primers:
         if p.chrom and not p.error:
@@ -1004,10 +1151,12 @@ def validate(primers, opts):
         elif p.chrom or opts.genome_check:
             continue  # described from genome sites below
         else:
-            gene, err = resolve_gene(ncbi, p.base, opts.organism, gene_cache, opts)
+            gene, err, warning = resolve_gene(ncbi, [p.base], opts.organism, gene_cache, opts)
             if gene is None:
                 p.binding = err
                 continue
+            if warning:
+                gene = replace(gene, note=warning)
             parts = []
             for acc, seq in gene.transcripts:
                 sites = find_primer_sites(p.seq, seq, opts.max_mismatches, opts.exact_3prime)
@@ -1067,7 +1216,7 @@ def print_summary(pairs_df, unpaired, opts):
     if unpaired:
         print(f"\nPrimers without a Fwd/Rev partner ({len(unpaired)}): "
               + ', '.join(p.name for p in unpaired))
-        print('  (name pairs as <Name>_Fwd / <Name>_Rev to have them checked as a pair)')
+        print('  (name pairs <Gene>_Fwd / <Gene>_Rev, or put each Fwd directly above its Rev)')
 
     for status, title in (('WARN', 'PAIRS WITH WARNINGS'), ('FAIL', 'PAIRS THAT FAILED'),
                           ('ERROR', 'PAIRS WITH ERRORS')):

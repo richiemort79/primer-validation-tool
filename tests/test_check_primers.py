@@ -11,20 +11,34 @@ import check_primers as cp  # noqa: E402
 
 
 @pytest.mark.parametrize('name, expected', [
-    ('Mitf_Fwd', ('Mitf', 'F', '')),
-    ('Mitf_Rev', ('Mitf', 'R', '')),
-    ('Tyr_EnH_rev', ('Tyr_EnH', 'R', '')),
-    ('Cre_For', ('Cre', 'F', '')),
-    ('Gapdh_F1', ('Gapdh', 'F', '1')),
-    ('Gapdh-R2', ('Gapdh', 'R', '2')),
-    ('Actb_FORWARD', ('Actb', 'F', '')),
-    ('Rev3l_Fwd', ('Rev3l', 'F', '')),       # gene name contains "Rev"
-    ('Forl_Rev', ('Forl', 'R', '')),
-    ('Chr1_L_Flank', ('Chr1_L_Flank', None, '')),
-    ('Cdkn2aR', ('Cdkn2aR', None, '')),      # no separator: not a direction
+    ('Mitf_Fwd', ('Mitf', 'F', '', '')),
+    ('Mitf_Rev', ('Mitf', 'R', '', '')),
+    ('Tyr_EnH_rev', ('Tyr_EnH', 'R', '', '')),
+    ('Cre_For', ('Cre', 'F', '', '')),
+    ('Gapdh_F1', ('Gapdh', 'F', '1', '')),
+    ('Gapdh-R2', ('Gapdh', 'R', '2', '')),
+    ('Actb_FORWARD', ('Actb', 'F', '', '')),
+    ('Rev3l_Fwd', ('Rev3l', 'F', '', '')),       # gene name contains "Rev"
+    ('Forl_Rev', ('Forl', 'R', '', '')),
+    ('Mitf_Fwd_IM', ('Mitf', 'F', '', 'IM')),    # direction mid-name
+    ('Tryp1_Rev_IM', ('Tryp1', 'R', '', 'IM')),
+    ('Sox10_Fwd2_qPCR_v1', ('Sox10', 'F', '2', 'qPCR_v1')),
+    ('Chr1_L_Flank', ('Chr1_L_Flank', None, '', '')),
+    ('Chr1_R_Flank', ('Chr1_R_Flank', None, '', '')),   # mid-name single R is not a direction
+    ('Chr1_L_F', ('Chr1_L', 'F', '', '')),
+    ('Cdkn2aR', ('Cdkn2aR', None, '', '')),      # no separator: not a direction
+    ('Fwd', ('Fwd', None, '', '')),
 ])
 def test_parse_primer_name(name, expected):
     assert cp.parse_primer_name(name) == expected
+
+
+def test_name_distance_and_typo():
+    assert cp.name_distance('Tyrp1', 'Tryp1') == 1   # transposition
+    assert cp.probable_typo('Tyrp1', 'Tryp1')
+    assert not cp.probable_typo('Mitf', 'mitf')
+    assert not cp.probable_typo('Kit', 'Fit')        # too short to judge
+    assert not cp.probable_typo('Snai1', 'Sox10')
 
 
 @pytest.mark.parametrize('base, chrom', [
@@ -116,15 +130,47 @@ def test_products_respect_max_size():
     assert [p.size for p in cp.evaluate_on_sequence(fwd, rev, seq, 0, 5, 6000).products] == [4920]
 
 
-def test_pairing():
-    names = ['Mitf_Fwd', 'Mitf_Rev', 'Rev3l_Fwd', 'Rev3l_Rev', 'Gapdh_F1', 'Gapdh_R1',
-             'Gapdh_F2', 'Gapdh_R2', 'Cre_For', 'ERT_Rev', 'Chr1_L_Flank']
-    primers = [cp.Primer(n, 'ACGT' * 5, i, *cp.parse_primer_name(n)) for i, n in enumerate(names)]
+def _primers(names):
+    return [cp.Primer(n, 'ACGT' * 5, i, *cp.parse_primer_name(n)) for i, n in enumerate(names)]
+
+
+def _pairs(pairs):
+    return {(p.fwd.name, p.rev.name, p.how) for p in pairs}
+
+
+def test_pairing_by_name():
+    primers = _primers(['Mitf_Fwd', 'Rev3l_Fwd', 'Mitf_Rev', 'Rev3l_Rev', 'Gapdh_F1', 'Gapdh_F2',
+                        'Gapdh_R1', 'Gapdh_R2', 'Chr1_L_Flank', 'Chr1_R_Int'])
     pairs, unpaired = cp.pair_primers(primers)
-    assert {(f.name, r.name) for f, r in pairs} == {
-        ('Mitf_Fwd', 'Mitf_Rev'), ('Rev3l_Fwd', 'Rev3l_Rev'),
-        ('Gapdh_F1', 'Gapdh_R1'), ('Gapdh_F2', 'Gapdh_R2')}
-    assert [p.name for p in unpaired] == ['Cre_For', 'ERT_Rev', 'Chr1_L_Flank']
+    assert _pairs(pairs) == {
+        ('Mitf_Fwd', 'Mitf_Rev', 'name'), ('Rev3l_Fwd', 'Rev3l_Rev', 'name'),
+        ('Gapdh_F1', 'Gapdh_R1', 'name'), ('Gapdh_F2', 'Gapdh_R2', 'name')}
+    assert [p.name for p in unpaired] == ['Chr1_L_Flank', 'Chr1_R_Int']
+
+
+def test_pairing_melanoblast_sheet():
+    primers = _primers(['Mitf_Fwd_IM', 'Mitf_Rev_IM', 'Tyrp1_Fwd_IM', 'Tryp1_Rev_IM',
+                        'Endrb_Fwd_IM', 'Endrb_Rev_IM'])
+    pairs, unpaired = cp.pair_primers(primers)
+    assert _pairs(pairs) == {('Mitf_Fwd_IM', 'Mitf_Rev_IM', 'name'),
+                             ('Tyrp1_Fwd_IM', 'Tryp1_Rev_IM', 'typo'),
+                             ('Endrb_Fwd_IM', 'Endrb_Rev_IM', 'name')}
+    assert unpaired == []
+
+
+def test_pairing_adjacent_rows():
+    primers = _primers(['Cre_For', 'ERT_Rev', 'Tyr_Pro_For', 'Tyr_EnH_rev',
+                        'Chr1_L_Flank', 'Chr1_L_Int', 'Lone_Fwd', 'Other_Fwd'])
+    pairs, unpaired = cp.pair_primers(primers)
+    assert _pairs(pairs) == {('Cre_For', 'ERT_Rev', 'adjacent'),
+                             ('Tyr_Pro_For', 'Tyr_EnH_rev', 'adjacent')}
+    assert [p.name for p in unpaired] == ['Chr1_L_Flank', 'Chr1_L_Int', 'Lone_Fwd', 'Other_Fwd']
+
+
+def test_typo_pairing_not_adjacent():
+    primers = _primers(['Tyrp1_Fwd', 'Mitf_Fwd', 'Mitf_Rev', 'Tryp1_Rev'])
+    pairs, _ = cp.pair_primers(primers)
+    assert ('Tyrp1_Fwd', 'Tryp1_Rev', 'typo') in _pairs(pairs)
 
 
 def test_load_primers_finds_header(tmp_path):
