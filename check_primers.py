@@ -1283,7 +1283,7 @@ Environment:
   PRIMER_TOOL_CACHE  cache directory (default ~/.cache/primer_validation_tool)
         """)
     parser.add_argument('input_file', nargs='?', help='Excel (.xlsx) or CSV file with primers')
-    parser.add_argument('-o', '--output', help='Output Excel file (default: <input>_validation_results.xlsx)')
+    parser.add_argument('-o', '--output', help='Output Excel file (default: <input>_validation_results.xlsx in the input file\'s folder)')
     parser.add_argument('--sheet', help='Worksheet name (default: first sheet)')
     parser.add_argument('--organism', default='Mus musculus', help='Organism (default: Mus musculus)')
     parser.add_argument('--min-size', type=int, default=70, help='Minimum target amplicon size (default 70)')
@@ -1316,7 +1316,8 @@ def main():
     if not os.path.exists(input_file):
         print(f"\n❌ Error: File not found: {input_file}")
         sys.exit(1)
-    output_file = opts.output or f"{os.path.splitext(os.path.basename(input_file))[0]}_validation_results.xlsx"
+    # Default: next to the input file, wherever the script is run from
+    output_file = opts.output or f"{os.path.splitext(os.path.abspath(input_file))[0]}_validation_results.xlsx"
 
     try:
         primers = load_primers(input_file, opts.sheet)

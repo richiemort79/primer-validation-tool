@@ -2,6 +2,9 @@
 
 ## Version 2.1.0 (2026-10-07)
 
+### Output
+- Results are saved next to the input file by default, not in the current directory
+
 ### Pairing
 - Direction word can sit anywhere in the name, e.g. `Mitf_Fwd_IM` (previously these all came out unpaired)
 - Unpaired Fwd/Rev primers on neighbouring rows are paired (order sheets list pairs on alternate lines)

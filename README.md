@@ -87,7 +87,7 @@ Genes whose names merely start with "Chr" (`Chrm1`, `Chrna7`, `Chrd`) are treate
 
 ## Output
 
-An Excel file (default `<input>_validation_results.xlsx`) with three sheets.
+An Excel file with three sheets. By default it is saved next to the input file as `<input>_validation_results.xlsx`, whichever directory you run the script from. `-o` overrides this; a relative `-o` path is relative to your current directory.
 
 ### Pairs
 
