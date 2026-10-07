@@ -449,13 +449,13 @@ def pair_primers(primers):
         if free(a) and free(b) and {a.direction, b.direction} == {'F', 'R'}:
             f, r = (a, b) if a.direction == 'F' else (b, a)
             if probable_typo(f.base, r.base):
-                link(f, r, 'typo', f"Names don't match ('{f.base}' vs '{r.base}'): "
-                                   f"probable typo, paired as neighbouring rows")
+                link(f, r, 'typo', f"Primer names don't match: '{f.name}' vs '{r.name}'. "
+                                   f"Probably a typo; fix the name before ordering")
             elif f.base.lower() == r.base.lower():
-                link(f, r, 'adjacent', 'Paired as neighbouring rows (name suffixes differ)')
+                link(f, r, 'adjacent', 'Paired because they are on neighbouring rows (name endings differ)')
             else:
-                link(f, r, 'adjacent', f"Paired as neighbouring rows (names differ: "
-                                       f"'{f.base}' vs '{r.base}')")
+                link(f, r, 'adjacent', f"Paired because they are on neighbouring rows "
+                                       f"('{f.base}' and '{r.base}' differ)")
             i += 2
         else:
             i += 1
@@ -466,7 +466,8 @@ def pair_primers(primers):
                       and probable_typo(f.base, r.base)]
         if candidates:
             r = min(candidates, key=lambda r: name_distance(f.base, r.base))
-            link(f, r, 'typo', f"Names don't match ('{f.base}' vs '{r.base}'): probable typo")
+            link(f, r, 'typo', f"Primer names don't match: '{f.name}' vs '{r.name}'. "
+                               f"Probably a typo; fix the name before ordering")
 
     unpaired = [p for p in primers if not p.paired_with]
     return pairs, unpaired
@@ -717,12 +718,13 @@ def resolve_gene(ncbi, bases, organism, gene_cache, opts):
                 # Only an official symbol: a suggestion that is merely an alias
                 # (tryp -> Prss2) is too likely to be the wrong gene
                 if gene and gene.symbol.lower() == suggestion.lower():
-                    return gene, None, (f"No gene named '{symbol}'; checked against NCBI's "
-                                        f"spelling suggestion {gene.symbol} (fix the name if that "
-                                        f"is the intended gene)")
+                    return gene, None, (f"There is no gene called '{symbol}', so the primers were "
+                                        f"checked against {gene.symbol} instead. Probably a typo; "
+                                        f"rename to {gene.symbol} if that is the intended gene")
 
     tried = "' / '".join(c for b in bases for c in gene_symbol_candidates(b))
-    return None, f"No {organism} gene named '{tried}' in NCBI Gene", None
+    return None, (f"No {organism} gene called '{tried}' in NCBI Gene: check the name "
+                  f"(transgenes such as Cre can't be checked)"), None
 
 
 # --------------------------------------------------------------------------
@@ -857,8 +859,9 @@ def blank_result(fwd, rev, target):
         'Pair': f'{fwd.name} + {rev.name}',
         'Target': target,
         'Status': 'FAIL',
+        'Problem': [],          # list while evaluating; joined by format_problems for output
         'Amplicon_Size_bp': None,
-        'Details': '',
+        'Notes': '',
         'Matched_Transcripts': '',
         'Transcripts_Amplified': '',
         'Genomic_Amplicon_bp': None,
@@ -908,57 +911,64 @@ def evaluate_gene_pair(fwd, rev, gene, opts, genome=None):
         f_mm, r_mm = product_mismatches(product)
         result['Fwd_Mismatches'], result['Rev_Mismatches'] = f_mm, r_mm
 
-        if opts.min_size <= size <= opts.max_size:
-            notes.insert(0, f'Amplicon {size} bp on {acc}')
-        else:
-            warnings.append(f'Amplicon {size} bp on {acc} is outside {opts.min_size}-{opts.max_size} bp')
-        if f_mm or r_mm:
-            warnings.append(f'Mismatches vs {acc}: Fwd {f_mm}, Rev {r_mm}')
+        notes.insert(0, f'{size} bp product on {acc}')
+        if not opts.min_size <= size <= opts.max_size:
+            warnings.append(f'Product is {size} bp, outside the {opts.min_size}-{opts.max_size} bp target')
+        for which, mm in (('Forward', f_mm), ('Reverse', r_mm)):
+            if mm:
+                warnings.append(f"{which} primer has {mm} mismatch{'es' if mm > 1 else ''} with {acc}: "
+                                f'check the sequence (typo or strain difference?)')
         if len(primary.products) > 1:
-            warnings.append(f'{len(primary.products)} products on {acc}: '
-                            + ', '.join(f'{p.size} bp' for p in primary.products))
+            warnings.append(f'Makes {len(primary.products)} different products on {acc} ('
+                            + ', '.join(f'{p.size}' for p in primary.products)
+                            + ' bp): expect extra bands / melt peaks')
         if primary.extra:
-            warnings.append(f'Single-primer product(s) on {acc}: '
-                            + ', '.join(f'{p.size} bp' for p in primary.extra))
+            warnings.append(f'One primer on its own also amplifies {acc} ('
+                            + ', '.join(f'{p.size}' for p in primary.extra)
+                            + ' bp): may give extra products')
         if product.left.primer == 'R':
-            notes.append('Fwd/Rev are swapped relative to the transcript orientation')
+            notes.append('Fwd/Rev names are swapped relative to the transcript (works the same)')
         sizes = {p.products[0].size for _, p in amplified}
         if len(sizes) > 1:
-            notes.append(f"Product size varies between isoforms ({', '.join(map(str, sorted(sizes)))} bp)")
-        if len(amplified) < len(tx_results):
-            notes.append(f'Does not amplify {len(tx_results) - len(amplified)} of {len(tx_results)} transcripts')
+            notes.append(f"Product size differs between isoforms ({', '.join(map(str, sorted(sizes)))} bp)")
+        notes.append(f'Amplifies all {len(tx_results)} {gene.symbol} transcripts'
+                     if len(amplified) == len(tx_results) and len(tx_results) > 1 else
+                     f'Amplifies {len(amplified)} of {len(tx_results)} {gene.symbol} transcripts'
+                     if len(tx_results) > 1 else f'{gene.symbol} has one RefSeq transcript')
         if gen is not None:
             if gen.products:
-                notes.append(f'Also amplifies genomic DNA ({gen.products[0].size} bp): does not span an intron')
+                notes.append(f'Does not span an intron: genomic DNA also gives a {gen.products[0].size} bp '
+                             f'product (DNase-treat RNA)')
             else:
-                notes.append(f'No genomic DNA product <= {opts.max_product} bp (spans an intron/exon junction)')
+                notes.append('Spans an intron/exon junction (no product from genomic DNA)')
         result['Status'] = 'WARN' if warnings else 'PASS'
     elif gen and gen.products:
         product = gen.products[0]
         result['Amplicon_Size_bp'] = product.size
         result['Fwd_Mismatches'], result['Rev_Mismatches'] = product_mismatches(product)
-        warnings.append(f'No product on any of {len(tx_results)} RefSeq transcripts; '
-                        f'product only on genomic DNA ({product.size} bp)')
+        warnings.append(f"Doesn't amplify any {gene.symbol} mRNA ({len(tx_results)} RefSeq transcripts "
+                        f'checked), only genomic DNA ({product.size} bp): it will not measure expression')
         if not opts.min_size <= product.size <= opts.max_size:
-            warnings.append(f'Size outside {opts.min_size}-{opts.max_size} bp')
+            warnings.append(f'Product is {product.size} bp, outside the {opts.min_size}-{opts.max_size} bp target')
         result['Status'] = 'WARN'
     else:
         all_results = [r for _, r in tx_results] + ([gen] if gen else [])
         f_binds = any(r.fwd_sites for r in all_results)
         r_binds = any(r.rev_sites for r in all_results)
-        where = f'{gene.symbol} transcripts or genomic region'
+        checked = (f'{len(tx_results)} {gene.symbol} transcripts and the {gene.symbol} genomic region '
+                   f'±{opts.flank} bp')
         if not f_binds and not r_binds:
-            result['Details'] = f'Neither primer binds {where}'
+            warnings.append(f"Neither primer matches {gene.symbol} (checked {checked})")
         elif not f_binds:
-            result['Details'] = f'Forward primer does not bind {where}'
+            warnings.append(f"Forward primer doesn't match {gene.symbol} (checked {checked})")
         elif not r_binds:
-            result['Details'] = f'Reverse primer does not bind {where}'
+            warnings.append(f"Reverse primer doesn't match {gene.symbol} (checked {checked})")
         else:
-            result['Details'] = (f'Both primers bind {gene.symbol} but form no product '
-                                 f'<= {opts.max_product} bp (wrong orientation or too far apart)')
+            warnings.append(f'Both primers match {gene.symbol} but cannot make a product together '
+                            f'(facing the wrong way or more than {opts.max_product} bp apart)')
         if not gene.transcripts and not gene.genomic:
             result['Status'] = 'ERROR'
-            result['Details'] = f'No sequences available for {gene.symbol} in NCBI'
+            warnings[:] = [f'NCBI has no sequences for {gene.symbol}']
 
     if genome is not None:
         products, names, saturated = genome
@@ -967,17 +977,29 @@ def evaluate_gene_pair(fwd, rev, gene, opts, genome=None):
         result['Genome_Products'] = (f'{len(on)} on-target, {len(off)} off-target'
                                      + (f': {describe_products(off, names)}' if off else ''))
         if saturated:
-            warnings.append('Primer is repetitive (too many genome sites to list)')
+            warnings.append('A primer matches too many places in the genome (repetitive sequence)')
         if off:
-            warnings.append(f'{len(off)} off-target genome product(s)')
+            same_size = result['Amplicon_Size_bp'] in {p.size for p in off}
+            sites = ', '.join(f'{p.location()}, {p.size} bp' for p in off[:3])
+            if len(off) > 3:
+                sites += ' ...'
+            warnings.append(f"Also amplifies {len(off)} other genomic site{'s' if len(off) > 1 else ''} "
+                            f'({sites}): genomic DNA contamination could give a false signal'
+                            + ('. Same size as the cDNA product, so probably a processed pseudogene'
+                               if same_size else ''))
             if result['Status'] == 'PASS':
                 result['Status'] = 'WARN'
 
-    if result['Status'] in ('PASS', 'WARN'):
-        result['Details'] = '; '.join(warnings + notes)
-    elif warnings or notes:
-        result['Details'] = '; '.join([result['Details']] + warnings + notes)
+    result['Problem'] = warnings
+    result['Notes'] = '; '.join(notes)
     return result
+
+
+def format_problems(problems):
+    """One problem as-is; several numbered so each stands out"""
+    if len(problems) <= 1:
+        return ''.join(problems)
+    return ' '.join(f'({i}) {p}.' for i, p in enumerate(problems, 1))
 
 
 def evaluate_chrom_pair(fwd, rev, f_idx, r_idx, genome_sites, saturated, names, opts):
@@ -994,14 +1016,14 @@ def evaluate_chrom_pair(fwd, rev, f_idx, r_idx, genome_sites, saturated, names, 
         f_here = [s for s in genome_sites.get(f_idx, []) if s.chrom == fwd.chrom]
         r_here = [s for s in genome_sites.get(r_idx, []) if s.chrom == fwd.chrom]
         if not f_here and not r_here:
-            result['Details'] = f'Neither primer binds {fwd.chrom}'
+            result['Problem'] = [f'Neither primer matches {fwd.chrom}']
         elif not f_here:
-            result['Details'] = f'Forward primer does not bind {fwd.chrom}'
+            result['Problem'] = [f"Forward primer doesn't match {fwd.chrom}"]
         elif not r_here:
-            result['Details'] = f'Reverse primer does not bind {fwd.chrom}'
+            result['Problem'] = [f"Reverse primer doesn't match {fwd.chrom}"]
         else:
-            result['Details'] = (f'Both primers bind {fwd.chrom} but form no product '
-                                 f'<= {opts.max_product} bp')
+            result['Problem'] = [f'Both primers match {fwd.chrom} but cannot make a product together '
+                                 f'(facing the wrong way or more than {opts.max_product} bp apart)']
         return result
 
     product = on[0]
@@ -1011,16 +1033,21 @@ def evaluate_chrom_pair(fwd, rev, f_idx, r_idx, genome_sites, saturated, names, 
     result.update({'Amplicon_Size_bp': product.size, 'Fwd_Mismatches': f_mm, 'Rev_Mismatches': r_mm})
     warnings = []
     if len(on) > 1:
-        warnings.append(f'{len(on)} products on {fwd.chrom}: {describe_products(on, names)}')
-    if f_mm or r_mm:
-        warnings.append(f'Mismatches: Fwd {f_mm}, Rev {r_mm}')
+        warnings.append(f'Makes {len(on)} different products on {fwd.chrom} '
+                        f'({describe_products(on, names)}): expect extra bands')
+    for which, mm in (('Forward', f_mm), ('Reverse', r_mm)):
+        if mm:
+            warnings.append(f"{which} primer has {mm} mismatch{'es' if mm > 1 else ''} with the genome: "
+                            f'check the sequence')
     if off:
-        warnings.append(f'{len(off)} other product(s) incl. single-primer/off-chromosome')
+        warnings.append(f'Also makes {len(off)} other product(s) elsewhere or from one primer alone '
+                        f'({describe_products(off, names, 3)})')
     if {f_idx, r_idx} & saturated:
-        warnings.append('Primer is repetitive (too many genome sites to list)')
+        warnings.append('A primer matches too many places in the genome (repetitive sequence)')
     result['Status'] = 'WARN' if warnings else 'PASS'
-    result['Details'] = '; '.join(warnings + [f'Product {product.location()} ({product.size} bp); '
-                                              f'qPCR size window not applied to chromosome loci'])
+    result['Problem'] = warnings
+    result['Notes'] = (f'{product.size} bp product at {product.location()} '
+                       f'(qPCR size window not applied to chromosome loci)')
     return result
 
 
@@ -1041,8 +1068,8 @@ def inferred_rows(group_ids, primers, genome_sites, names, opts, existing_pairs,
             'Amplicon_Size_bp': p.size,
             'Fwd_Mismatches': p.left.mismatches,
             'Rev_Mismatches': p.right.mismatches,
-            'Details': (f'Product {p.location()} ({p.size} bp) predicted from binding sites'
-                        + ('; single primer primes both ends' if a is b else '')),
+            'Notes': (f'{p.size} bp product at {p.location()}, predicted from where the primers bind'
+                      + ('; this one primer binds both ends' if a is b else '')),
         })
         rows.append(row)
     return rows
@@ -1102,11 +1129,11 @@ def validate(primers, opts):
         warning = None
         if fwd.error or rev.error:
             row = blank_result(fwd, rev, fwd.label)
-            row.update(Status='ERROR', Details='; '.join(e for e in (fwd.error, rev.error) if e))
+            row.update(Status='ERROR', Problem=[e for e in (fwd.error, rev.error) if e])
         elif fwd.chrom and rev.chrom:
             if genome_error or db is None:
                 row = blank_result(fwd, rev, fwd.chrom)
-                row.update(Status='ERROR', Details=genome_error or 'Genome not searched')
+                row.update(Status='ERROR', Problem=[genome_error or 'Genome not searched'])
             else:
                 row = evaluate_chrom_pair(fwd, rev, f_idx, r_idx, genome_sites, saturated, names, opts)
         else:
@@ -1115,21 +1142,22 @@ def validate(primers, opts):
             gene, err, warning = resolve_gene(ncbi, bases, opts.organism, gene_cache, opts)
             if gene is None:
                 row = blank_result(fwd, rev, fwd.label)
-                row.update(Status='ERROR', Details=err)
+                row.update(Status='ERROR', Problem=[err])
             else:
                 genome = None
                 if opts.genome_check and not genome_error:
                     genome = (genome_products([f_idx, r_idx], genome_sites, opts.max_product),
                               names, {f_idx, r_idx} & saturated)
                 row = evaluate_gene_pair(fwd, rev, gene, opts, genome)
-        flags = [(pair.note, pair.how == 'typo'), (warning, True)]
-        for text, is_warning in reversed(flags):
-            if text:
-                row['Details'] = f"{text}; {row['Details']}" if row['Details'] else text
-                if is_warning and row['Status'] == 'PASS':
-                    row['Status'] = 'WARN'
-        symbol = {'PASS': '✓', 'WARN': '⚠', 'FAIL': '✗', 'ERROR': '✗'}[row['Status']]
-        print(f"  {symbol} {row['Status']}: {row['Details']}\n")
+        # Naming problems go first: they are the thing to fix before ordering
+        name_problems = [t for t in (warning, pair.note if pair.how == 'typo' else None) if t]
+        if name_problems:
+            row['Problem'] = name_problems + row['Problem']
+            if row['Status'] == 'PASS':
+                row['Status'] = 'WARN'
+        if pair.how == 'adjacent':
+            row['Notes'] = '; '.join(t for t in (pair.note, row['Notes']) if t)
+        print_result(row)
         rows.append(row)
 
     # ---- Primers without a named partner
@@ -1175,6 +1203,8 @@ def validate(primers, opts):
             p.binding = (describe_sites(genome_sites[i]) or f'no binding site in {db}'
                          if i not in saturated else 'repetitive: too many genome sites')
 
+    for row in rows:
+        row['Problem'] = format_problems(row['Problem'])
     pairs_df = pd.DataFrame(rows, columns=list(blank_result(Primer('', '', 0), Primer('', '', 0), '').keys()))
     if not pairs_df.empty:
         pairs_df['_order'] = pairs_df['Status'].map(STATUS_ORDER)
@@ -1194,6 +1224,16 @@ def validate(primers, opts):
     return pairs_df, primers_df, unpaired
 
 
+def print_result(row):
+    symbol = {'PASS': '✓', 'WARN': '⚠', 'FAIL': '✗', 'ERROR': '✗'}[row['Status']]
+    print(f"  {symbol} {row['Status']}")
+    if row['Problem']:
+        print(f"      Problem: {format_problems(row['Problem'])}")
+    if row['Notes']:
+        print(f"      Notes:   {row['Notes']}")
+    print()
+
+
 def print_summary(pairs_df, unpaired, opts):
     print(f"\n{'=' * 70}\nVALIDATION SUMMARY\n{'=' * 70}\n")
     named = pairs_df[pairs_df['Status'] != 'INFERRED']
@@ -1201,7 +1241,7 @@ def print_summary(pairs_df, unpaired, opts):
     counts = named['Status'].value_counts()
     labels = [
         ('PASS', '✓', f'PASS ({opts.min_size}-{opts.max_size} bp, clean)'),
-        ('WARN', '⚠', 'WARN (see Details)'),
+        ('WARN', '⚠', 'WARN (product forms; see Problem)'),
         ('FAIL', '✗', 'FAIL (no product)'),
         ('ERROR', '✗', 'ERROR (lookup/input problem)'),
     ]
@@ -1209,7 +1249,7 @@ def print_summary(pairs_df, unpaired, opts):
     for status, sym, label in labels:
         c = int(counts.get(status, 0))
         pct = f' ({c / total * 100:.1f}%)' if total else ''
-        print(f'{sym} {label:<32} {c}{pct}')
+        print(f'{sym} {label:<36} {c}{pct}')
     inferred = int((pairs_df['Status'] == 'INFERRED').sum())
     if inferred:
         print(f'ℹ Inferred products from unpartnered primers: {inferred}')
@@ -1224,7 +1264,8 @@ def print_summary(pairs_df, unpaired, opts):
         if len(subset):
             print(f"\n{'=' * 70}\n{title}:\n{'=' * 70}")
             for _, row in subset.iterrows():
-                print(f"  {row['Pair']}: {row['Details']}")
+                print(f"  {row['Pair']}")
+                print(f"      {row['Problem']}")
 
 
 def write_report(pairs_df, primers_df, output_file, opts):

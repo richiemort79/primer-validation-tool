@@ -78,7 +78,7 @@ Each name is split into words on `_`, `-`, `.` or spaces. A direction word (`Fwd
 Primers are paired in this order:
 
 1. **Same name** apart from the direction (`Mitf_Fwd_IM` + `Mitf_Rev_IM`).
-2. **Neighbouring rows**: an unpaired Fwd directly above or below an unpaired Rev, as order sheets usually list pairs on alternate lines (`Cre_For` + `ERT_Rev`). This is noted in *Details*.
+2. **Neighbouring rows**: an unpaired Fwd directly above or below an unpaired Rev, as order sheets usually list pairs on alternate lines (`Cre_For` + `ERT_Rev`). This is noted in *Notes*.
 3. **Near-identical names** anywhere in the sheet (`Tyrp1_Fwd` + `Tryp1_Rev`). This is reported as a probable typo, and the pair is marked WARN so you fix the name before ordering.
 
 If a gene name isn't found, the script tries swapping neighbouring letters and NCBI's spelling suggestion (`Endrb` → *Ednrb*). It only accepts a suggestion that is an official symbol. The pair is then checked against that gene and marked WARN.
@@ -96,8 +96,9 @@ An Excel file with three sheets. By default it is saved next to the input file a
 | **Pair** | `Fwd name + Rev name` |
 | **Target** | Gene symbol and description, or chromosome |
 | **Status** | PASS / WARN / FAIL / ERROR / INFERRED (see below) |
+| **Problem** | What is wrong and what to do about it. Blank for PASS; several problems are numbered |
 | **Amplicon_Size_bp** | Product size on the first amplified transcript (NM_ preferred) |
-| **Details** | Why it got that status, plus notes |
+| **Notes** | Information only: product size, transcripts amplified, whether it spans an intron |
 | **Matched_Transcripts** | Every RefSeq transcript amplified, with sizes |
 | **Transcripts_Amplified** | e.g. `7/9` |
 | **Genomic_Amplicon_bp** | Product on genomic DNA (blank = primers span an intron/junction) |
@@ -116,8 +117,8 @@ The parameters used for the run, for your records.
 ### Status meanings
 
 - **PASS**: product on the gene's transcript(s) within the size window. No mismatches, no extra products, no off-target products found.
-- **WARN**: a product forms, but something needs a look. Possible reasons: size outside the window, a mismatch, several products, product only on genomic DNA, or off-target genome products. The reason is in *Details*.
-- **FAIL**: no product. *Details* says whether one primer doesn't bind, or both bind but can't form a product.
+- **WARN**: a product forms, but something needs a look. Possible reasons: size outside the window, a mismatch, several products, product only on genomic DNA, or off-target genome products. The *Problem* column says what to check.
+- **FAIL**: no product. *Problem* says whether one primer doesn't bind, or both bind but can't form a product.
 - **ERROR**: the gene couldn't be found or fetched, or a sequence has invalid characters.
 - **INFERRED**: a product predicted between primers that weren't named as a pair (chromosome-locus sets; also unpartnered primers with `--genome-check`).
 
@@ -125,7 +126,7 @@ For **chromosome-locus** pairs the qPCR size window isn't applied. They PASS if 
 
 ## How it works
 
-1. **Gene lookup**: the gene is resolved in NCBI Gene by its exact symbol. If that fails, it tries an alias, which is reported in *Details*. All of the gene's RefSeq RNAs (NM_/NR_/XM_/XR_) are fetched, plus its genomic region ± flank, in gene orientation. Results are cached, so re-runs are fast.
+1. **Gene lookup**: the gene is resolved in NCBI Gene by its exact symbol. If that fails, it tries an alias, which is reported in *Notes*. All of the gene's RefSeq RNAs (NM_/NR_/XM_/XR_) are fetched, plus its genomic region ± flank, in gene orientation. Results are cached, so re-runs are fast.
 2. **Binding**: both strands are searched. The 3′-most bases must match exactly, and up to `--max-mismatches` are tolerated elsewhere.
 3. **Products**: any forward-facing site followed by a reverse-facing site within `--max-product` bp. This also catches single-primer products and swapped Fwd/Rev names.
 4. **Genome**: chromosomes are downloaded once from UCSC (`hgdownload`) and searched locally. This covers chromosome loci, and every chromosome with `--genome-check`.

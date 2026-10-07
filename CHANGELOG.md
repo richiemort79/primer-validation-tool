@@ -4,6 +4,7 @@
 
 ### Output
 - Results are saved next to the input file by default, not in the current directory
+- `Details` split into `Problem` (what is wrong and what to do; blank for PASS) and `Notes` (information only); messages reworded in plain language, and the console shows the problem on its own line
 
 ### Pairing
 - Direction word can sit anywhere in the name, e.g. `Mitf_Fwd_IM` (previously these all came out unpaired)
