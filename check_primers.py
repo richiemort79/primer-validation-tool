@@ -927,6 +927,7 @@ def blank_result(fwd, rev, target):
         'Rev_GC_Clamp': rev.stats.get('clamp'),
         'Fwd_Mismatches': None,
         'Rev_Mismatches': None,
+        'Suggested_Alternative': '',   # only with --suggest
     }
 
 
@@ -1403,22 +1404,26 @@ def intron_spanning(fwd, rev, template, exons, opts):
 
 def suggestion_reason(row):
     """Why alternatives are being suggested for a pair"""
-    if row['Status'] in ('WARN', 'FAIL') and row['Problem']:
-        return format_problems(row['Problem'])
-    if pd.notna(row.get('Genomic_Amplicon_bp')):
-        return f"Does not span an intron (genomic DNA gives a {int(row['Genomic_Amplicon_bp'])} bp product)"
-    return ''
+    return format_problems(row['Problem'])
 
 
 def needs_alternatives(row):
-    return row['Status'] in ('WARN', 'FAIL') or pd.notna(row.get('Genomic_Amplicon_bp'))
+    """Only pairs with a problem: a PASS pair is fine as it is"""
+    return row['Status'] in ('WARN', 'FAIL')
+
+
+def describe_alternative(alt):
+    """The top-ranked alternative in one cell of the Pairs sheet"""
+    return (f"Fwd {alt['Fwd_Primer']}, Rev {alt['Rev_Primer']} ({alt['Source']}; "
+            f"{alt['Amplicon_Size_bp']} bp, {alt['Transcripts_Amplified']} transcripts; "
+            f"Tm {alt['Fwd_Tm_C']}/{alt['Rev_Tm_C']} °C)")
 
 
 def suggest_alternatives(jobs, opts, db):
     """
-    For each (pair, gene, row) whose primers have a problem or don't span an
-    intron, gather PrimerBank and Primer3 candidates, check each one exactly
-    as the original pairs are checked, and return the best as rows.
+    For each (pair, gene, row) whose primers have a problem, gather PrimerBank and Primer3 candidates, check each one exactly
+    as the original pairs are checked, and return the best as rows. The top
+    one is also written into the pair's own row (Suggested_Alternative).
     """
     prepared = []
     for pair, gene, row in jobs:
@@ -1501,6 +1506,10 @@ def suggest_alternatives(jobs, opts, db):
                 break
         if not chosen:
             print('  No alternative found that passes cleanly and avoids genomic DNA')
+            row['Suggested_Alternative'] = 'None found that passes cleanly and avoids genomic DNA'
+        else:
+            row['Notes'] = '; '.join(t for t in (row['Notes'], 'More alternatives on the '
+                                                 'Alternatives sheet') if t)
         for rank, (c, res, how) in enumerate(chosen, 1):
             print(f"  {rank}. {c.label}: {res['Amplicon_Size_bp']} bp, {how}, "
                   f"amplifies {res['Transcripts_Amplified']} transcripts"
@@ -1530,6 +1539,8 @@ def suggest_alternatives(jobs, opts, db):
                 'Rev_GC%': res['Rev_GC%'],
                 'Notes': res['Notes'],
             })
+            if rank == 1:
+                row['Suggested_Alternative'] = describe_alternative(rows[-1])
     return pd.DataFrame(rows)
 
 
@@ -1672,15 +1683,12 @@ def validate(primers, opts):
         print(f"\n{'=' * 70}\nSuggesting alternatives for {len(suggest_jobs)} pair"
               f"{'s' if len(suggest_jobs) > 1 else ''}\n{'=' * 70}")
         alternatives = suggest_alternatives(suggest_jobs, opts, None if genome_error else db)
-        offered = set(alternatives['For_Pair']) if not alternatives.empty else set()
-        for row in rows:
-            if row['Pair'] in offered:
-                row['Notes'] = '; '.join(t for t in (row['Notes'], 'Alternatives suggested on the '
-                                                     'Alternatives sheet') if t)
 
     for row in rows:
         row['Problem'] = format_problems(row['Problem'])
     pairs_df = pd.DataFrame(rows, columns=list(blank_result(Primer('', '', 0), Primer('', '', 0), '').keys()))
+    if not opts.suggest:
+        pairs_df = pairs_df.drop(columns='Suggested_Alternative')
     if not pairs_df.empty:
         pairs_df['_order'] = pairs_df['Status'].map(STATUS_ORDER)
         pairs_df = pairs_df.sort_values('_order', kind='stable').drop(columns='_order')
@@ -1850,7 +1858,7 @@ Environment:
     parser.add_argument('--cache-dir', default=str(DEFAULT_CACHE), help=f'Cache directory (default {DEFAULT_CACHE})')
     parser.add_argument('--refresh', action='store_true', help='Ignore cached NCBI gene and PrimerBank data')
     parser.add_argument('--suggest', action='store_true',
-                        help="For pairs that don't span an intron or have a problem, suggest better "
+                        help='For pairs that WARN or FAIL, suggest better '
                              'pairs (PrimerBank, then Primer3 designs), each checked like your own')
     parser.add_argument('--suggest-count', type=int, default=3,
                         help='Alternatives to suggest per pair (default 3)')

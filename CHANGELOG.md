@@ -14,6 +14,8 @@
 ### Suggestions
 - For primers with a low or mismatched Tm, `--suggest` offers your own pair lengthened at the 5' end (3' end unchanged), ranked first when it passes cleanly
 - Primer3 designs aim 2-7 °C above the annealing temperature, at the same reaction conditions
+- `--suggest` only looks for replacements for WARN/FAIL pairs; PASS pairs that don't span an intron are no longer included
+- With `--suggest`, the Pairs sheet ends with a `Suggested_Alternative` column holding the top-ranked replacement pair
 
 ## Version 2.2.0 (2026-10-07)
 

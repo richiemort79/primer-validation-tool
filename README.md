@@ -5,7 +5,7 @@ A Python script that checks PCR primers in silico before you order them or run t
 - **Gene-targeted pairs** (e.g. `Mitf_Fwd` / `Mitf_Rev`) are tested against **every RefSeq transcript** of the gene and against the gene's **genomic region**, using NCBI. You get the amplicon size, which isoforms it amplifies, and whether it spans an intron (no genomic DNA product).
 - **Chromosome-locus primers** (e.g. `Chr1_L_Flank`, `Chr1_R_Int`) are located on that chromosome, on both strands. Every product they can form with each other is reported, so you don't need Fwd/Rev names for genotyping primer sets.
 - **Optional genome-wide check** (`--genome-check`) searches the whole genome for off-target products, similar to UCSC In-Silico PCR.
-- **Optional suggestions** (`--suggest`): for pairs that don't span an intron or have a problem, it proposes better pairs from Harvard PrimerBank and new Primer3 designs. Each one is checked exactly like your own primers.
+- **Optional suggestions** (`--suggest`): for pairs that WARN or FAIL, it proposes better pairs from Harvard PrimerBank and new Primer3 designs. Each one is checked exactly like your own primers.
 
 ## Requirements
 
@@ -95,7 +95,7 @@ Genes whose names merely start with "Chr" (`Chrm1`, `Chrna7`, `Chrd`) are treate
 
 ## Suggesting better primers
 
-With `--suggest`, the tool looks for replacements for any gene pair that doesn't span an intron (genomic DNA gives a product), or that gets WARN or FAIL. Pairs matched only because they sit on neighbouring rows with different names, such as promoter/enhancer genotyping primers, are left alone.
+With `--suggest`, the tool looks for replacements for any gene pair that gets WARN or FAIL. PASS pairs are left as they are, even if they don't span an intron: if they work, there's no reason to swap them. Pairs matched only because they sit on neighbouring rows with different names, such as promoter/enhancer genotyping primers, are left alone.
 
 Candidates come from two places:
 
@@ -140,6 +140,7 @@ An Excel file with three sheets, plus an Alternatives sheet with `--suggest`. By
 | **Fwd/Rev_Tm_2+4_C** | Tm by the 2+4 rule (2 °C per A/T, 4 °C per G/C), for comparison only |
 | **Fwd/Rev_GC_Clamp** | Which ends are G/C (`both ends`, `3' only`…), and whether the 3′ end is GC-rich (more than 3 of the last 5) |
 | **Fwd/Rev_Mismatches** | Mismatches at the sites used for the product |
+| **Suggested_Alternative** | With `--suggest`: the top-ranked replacement pair, with its source, size, transcripts and Tm (or "None found"). The rest are on the Alternatives sheet |
 
 ### Alternatives
 
