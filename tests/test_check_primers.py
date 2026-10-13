@@ -66,8 +66,35 @@ def test_reverse_complement_iupac():
 
 def test_tm_nearest_neighbour():
     tm = cp.calculate_tm('GGCTGTATTCCCCTCCATCG')
-    assert 55 < tm < 65                      # Wallace rule would give 64
+    assert 60 < tm < 67                      # mastermix conditions; 2+4 rule gives 64
     assert cp.calculate_tm('ACGTNACGTACGTACGTAC') is None
+
+
+def test_tm_conditions_follow_mg_and_primer_conc():
+    seq = 'ATGGCTGAAAGCAAGGAGTG'
+    default = cp.calculate_tm(seq)
+    try:
+        cp.set_tm_conditions(1.5, 50)            # Primer3's own defaults
+        assert cp.calculate_tm(seq) < default - 2
+    finally:
+        cp.set_tm_conditions(3.0, 250)
+
+
+def test_wallace_tm():
+    assert cp.wallace_tm('GGCTGTATTCCCCTCCATCG') == 64
+    assert cp.wallace_tm('ACGTSW') == 2 * 3 + 4 * 3
+    assert cp.wallace_tm('ACGTN') is None
+
+
+@pytest.mark.parametrize('seq, expected', [
+    ('GATTACAATTAC', 'both ends'),
+    ('GATTACAATTAT', "5' only"),
+    ('TATTACAATTAG', "3' only"),
+    ('TATTACAATTAT', 'neither end'),
+    ('GATTACAGCGCG', "both ends (3' end GC-rich: 5/5)"),
+])
+def test_clamp_status(seq, expected):
+    assert cp.clamp_status(seq) == expected
 
 
 def _random_seq(n, seed=1):
@@ -220,9 +247,7 @@ def test_map_exons_tolerates_snp():
     assert [(a, b) for a, b, _ in cp.map_exons(transcript, genomic)] == [(0, 200), (200, 380), (380, 600)]
 
 
-class _Opts:
-    min_size, max_size, max_product = 70, 150, 4000
-    max_mismatches, exact_3prime = 1, 5
+_Opts = cp.build_parser().parse_args([])   # the command-line defaults
 
 
 def test_design_primer3_avoids_genomic_dna():
@@ -230,10 +255,44 @@ def test_design_primer3_avoids_genomic_dna():
     exons = cp.map_exons(transcript, genomic)
     designs = cp.design_primer3(transcript, cp.exon_junctions(exons), _Opts)
     assert designs
+    lo, _, hi = cp.design_tm_range(_Opts)
     for c in designs:
+        for seq in (c.fwd, c.rev):
+            assert cp.has_clamp(seq, 5) and cp.has_clamp(seq, 3), seq
+            assert cp.end_gc(seq) <= cp.MAX_END_GC
+            assert lo - 0.5 <= cp.calculate_tm(seq) <= hi + 0.5
         kind, how, _ = cp.intron_spanning(c.fwd, c.rev, transcript, exons, _Opts)
         assert kind in (0, 1), how
         assert not cp.evaluate_on_sequence(c.fwd, c.rev, genomic, 1, 5, 4000).products
+
+
+def test_lengthen_pair_raises_low_tm_keeping_3prime_end():
+    transcript, _ = _gene_model()
+    # Short primers either side of the exon 1/2 junction: Tm well under 60 °C
+    fwd, rev = transcript[150:164], cp.reverse_complement(transcript[230:244])
+    assert cp.calculate_tm(fwd) < 60 and cp.calculate_tm(rev) < 60
+    c = cp.lengthen_pair(fwd, rev, transcript, _Opts)
+    assert c.source == 'Lengthened'
+    assert c.fwd.endswith(fwd) and c.rev.endswith(rev)        # only the 5' ends grow
+    assert transcript.find(c.fwd) == 150 - (len(c.fwd) - len(fwd))
+    assert cp.reverse_complement(c.rev) in transcript
+    min_tm = cp.design_tm_range(_Opts)[0]
+    assert cp.calculate_tm(c.fwd) >= min_tm and cp.calculate_tm(c.rev) >= min_tm
+    # Nothing to do for primers that are already fine
+    assert cp.lengthen_pair(c.fwd, c.rev, transcript, _Opts) is None
+
+
+def test_tm_and_clamp_checks():
+    low = cp.Primer('A_Fwd', 'ATTATAATTTAC', 0)
+    ok = cp.Primer('A_Rev', 'GCTCACCTCATTCTCCGAAGT', 0)
+    for p in (low, ok):
+        p.stats = cp.calculate_primer_stats(p.seq)
+    problems, notes = cp.tm_and_clamp_checks(low, ok, _Opts)
+    assert any('Forward primer Tm' in t for t in problems)
+    assert any('Tms differ' in t for t in problems)
+    problems, notes = cp.tm_and_clamp_checks(ok, ok, _Opts)
+    assert problems == [] and notes == ["Fwd primer has no G/C at its 3' end",
+                                        "Rev primer has no G/C at its 3' end"]
 
 
 def test_intron_spanning_within_exon():

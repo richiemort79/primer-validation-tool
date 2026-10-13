@@ -1,5 +1,20 @@
 # Changelog
 
+## Version 2.3.0 (2026-10-13)
+
+### Tm
+- Tm is calculated at SYBR mastermix conditions (3 mM Mg2+, 250 nM primer; `--mg`, `--primer-conc`) instead of Primer3's defaults (1.5 mM Mg2+, 50 nM), so values are ~4 °C higher than before and closer to the real reaction
+- New `Tm_2+4` columns show the 2+4 (Wallace) rule for comparison
+- Pairs WARN if a primer's Tm is below the annealing temperature (`--anneal`, default 60 °C), or the two Tms differ by more than `--max-tm-diff` (default 5 °C)
+
+### G/C clamps
+- New `GC_Clamp` columns show which primer ends are G/C, and flag GC-rich 3' ends (>3 G/C in the last 5); a missing 3' clamp is mentioned in Notes
+- Primer3 designs require a 3' G/C clamp (with at most 3 G/C in the last 5) and a 5' G/C (`--no-5prime-clamp` to drop the 5' rule); clamped pairs rank higher
+
+### Suggestions
+- For primers with a low or mismatched Tm, `--suggest` offers your own pair lengthened at the 5' end (3' end unchanged), ranked first when it passes cleanly
+- Primer3 designs aim 2-7 °C above the annealing temperature, at the same reaction conditions
+
 ## Version 2.2.0 (2026-10-07)
 
 ### New

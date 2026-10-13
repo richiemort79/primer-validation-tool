@@ -8,7 +8,9 @@ Checks PCR primer pairs in silico:
   * chromosome-locus primers (e.g. Chr1_L_Flank) are located on that chromosome
     (UCSC genome download, both strands) and the products they form are reported;
   * optionally (--genome-check) every primer is searched genome-wide to find
-    off-target products.
+    off-target products;
+  * primer Tm (at qPCR mastermix conditions) and G/C clamps are checked, and
+    with --suggest low-Tm primers are offered lengthened at the 5' end.
 
 Usage:
     python check_primers.py                          # Interactive file selection
@@ -79,6 +81,12 @@ DIRECTION_LETTER_RE = re.compile(r'(?P<dir>[fr])(?P<num>\d*)', re.IGNORECASE)
 # Chrd are still treated as genes.
 CHROM_RE = re.compile(r'^chr(?P<chrom>\d+|X|Y|M|MT)$', re.IGNORECASE)
 
+# Tm conditions (Primer3 calc_tm keywords): a typical SYBR qPCR mastermix,
+# 50 mM K+, 3 mM Mg2+, 0.8 mM total dNTPs, 250 nM each primer.
+# --mg and --primer-conc change Mg2+ and primer concentration.
+TM_CONDITIONS = {'mv_conc': 50.0, 'dv_conc': 3.0, 'dntp_conc': 0.8, 'dna_conc': 250.0}
+MAX_END_GC = 3   # most G/C allowed in the last 5 bases at the 3' end
+
 STATUS_ORDER = {'FAIL': 0, 'ERROR': 1, 'WARN': 2, 'PASS': 3, 'INFERRED': 4}
 
 DEFAULT_CACHE = Path(os.environ.get(
@@ -105,26 +113,62 @@ def invalid_bases(seq):
     return sorted(set(seq) - set(IUPAC))
 
 
+def set_tm_conditions(mg, primer_nm):
+    """Set the reaction conditions used for every Tm (from --mg / --primer-conc)"""
+    TM_CONDITIONS.update(dv_conc=mg, dna_conc=primer_nm)
+
+
 def calculate_tm(seq):
     """
-    Nearest-neighbour Tm (SantaLucia 1998) via Primer3, using Primer3's default
-    conditions: 50 mM monovalent, 1.5 mM Mg2+, 0.6 mM dNTPs, 50 nM oligo.
+    Nearest-neighbour Tm (SantaLucia 1998) via Primer3, under TM_CONDITIONS
+    (SYBR mastermix-like by default, which reads ~4 °C higher than Primer3's
+    own defaults of 1.5 mM Mg2+ and 50 nM oligo).
     Returns None for degenerate primers or if primer3-py is not installed.
     """
     if primer3 is None or not seq or set(seq) - set('ACGT'):
         return None
-    return round(primer3.calc_tm(seq), 1)
+    return round(primer3.calc_tm(seq, **TM_CONDITIONS), 1)
+
+
+def wallace_tm(seq):
+    """The 2+4 rule: 2 °C per A/T, 4 °C per G/C. None if other degenerate bases"""
+    if not seq or set(seq) - set('ACGTSW'):
+        return None
+    return 2 * sum(seq.count(b) for b in 'ATW') + 4 * sum(seq.count(b) for b in 'GCS')
+
+
+def has_clamp(seq, end):
+    """True if the primer has a G or C at its 5' or 3' end"""
+    return bool(seq) and (seq[0] if end == 5 else seq[-1]) in 'GCS'
+
+
+def end_gc(seq):
+    """G/C count in the last 5 bases at the 3' end (over 3 encourages mispriming)"""
+    return sum(b in 'GCS' for b in seq[-5:])
+
+
+def clamp_status(seq):
+    """Which ends have a G/C clamp, e.g. "both ends" or "3' only (3' end GC-rich: 4/5)" """
+    if not seq:
+        return ''
+    text = {(True, True): 'both ends', (True, False): "5' only",
+            (False, True): "3' only", (False, False): 'neither end'}[(has_clamp(seq, 5), has_clamp(seq, 3))]
+    if end_gc(seq) > MAX_END_GC:
+        text += f" (3' end GC-rich: {end_gc(seq)}/5)"
+    return text
 
 
 def calculate_primer_stats(seq):
-    """Length, GC content and Tm for a primer"""
+    """Length, GC content, Tm and end clamps for a primer"""
     if not seq:
-        return {'length': None, 'gc_content': None, 'tm': None}
+        return {'length': None, 'gc_content': None, 'tm': None, 'tm_wallace': None, 'clamp': ''}
     gc = seq.count('G') + seq.count('C') + seq.count('S')
     return {
         'length': len(seq),
         'gc_content': round(gc / len(seq) * 100, 1),
         'tm': calculate_tm(seq),
+        'tm_wallace': wallace_tm(seq),
+        'clamp': clamp_status(seq),
     }
 
 
@@ -877,9 +921,36 @@ def blank_result(fwd, rev, target):
         'Rev_GC%': rev.stats.get('gc_content'),
         'Fwd_Tm_C': fwd.stats.get('tm'),
         'Rev_Tm_C': rev.stats.get('tm'),
+        'Fwd_Tm_2+4_C': fwd.stats.get('tm_wallace'),
+        'Rev_Tm_2+4_C': rev.stats.get('tm_wallace'),
+        'Fwd_GC_Clamp': fwd.stats.get('clamp'),
+        'Rev_GC_Clamp': rev.stats.get('clamp'),
         'Fwd_Mismatches': None,
         'Rev_Mismatches': None,
     }
+
+
+def tm_and_clamp_checks(fwd, rev, opts):
+    """
+    Problems (Tm below the annealing step, or Tms too far apart) and notes
+    (missing 3' G/C clamp, GC-rich 3' end) from the primers' composition
+    """
+    problems, notes = [], []
+    f_tm, r_tm = fwd.stats.get('tm'), rev.stats.get('tm')
+    for which, tm in (('Forward', f_tm), ('Reverse', r_tm)):
+        if tm is not None and tm < opts.anneal:
+            problems.append(f'{which} primer Tm is {tm} °C, below the {opts.anneal:g} °C annealing step: '
+                            f"lengthen it at the 5' end")
+    if f_tm is not None and r_tm is not None and abs(f_tm - r_tm) > opts.max_tm_diff:
+        problems.append(f'Primer Tms differ by {abs(f_tm - r_tm):.1f} °C ({f_tm} vs {r_tm}): '
+                        f"lengthen the lower one at the 5' end")
+    for which, p in (('Fwd', fwd), ('Rev', rev)):
+        if p.seq and not has_clamp(p.seq, 3):
+            notes.append(f"{which} primer has no G/C at its 3' end")
+        elif p.seq and end_gc(p.seq) > MAX_END_GC:
+            notes.append(f"{which} primer 3' end is GC-rich ({end_gc(p.seq)} of last 5): "
+                         f'may prime non-specifically')
+    return problems, notes
 
 
 def evaluate_gene_pair(fwd, rev, gene, opts, genome=None):
@@ -991,6 +1062,13 @@ def evaluate_gene_pair(fwd, rev, gene, opts, genome=None):
             if result['Status'] == 'PASS':
                 result['Status'] = 'WARN'
 
+    if amplified or (gen and gen.products):
+        tm_problems, tm_notes = tm_and_clamp_checks(fwd, rev, opts)
+        warnings.extend(tm_problems)
+        notes.extend(tm_notes)
+        if tm_problems and result['Status'] == 'PASS':
+            result['Status'] = 'WARN'
+
     result['Problem'] = warnings
     result['Notes'] = '; '.join(notes)
     return result
@@ -1045,10 +1123,12 @@ def evaluate_chrom_pair(fwd, rev, f_idx, r_idx, genome_sites, saturated, names, 
                         f'({describe_products(off, names, 3)})')
     if {f_idx, r_idx} & saturated:
         warnings.append('A primer matches too many places in the genome (repetitive sequence)')
+    tm_problems, tm_notes = tm_and_clamp_checks(fwd, rev, opts)
+    warnings.extend(tm_problems)
     result['Status'] = 'WARN' if warnings else 'PASS'
     result['Problem'] = warnings
-    result['Notes'] = (f'{product.size} bp product at {product.location()} '
-                       f'(qPCR size window not applied to chromosome loci)')
+    result['Notes'] = '; '.join([f'{product.size} bp product at {product.location()} '
+                                 f'(qPCR size window not applied to chromosome loci)'] + tm_notes)
     return result
 
 
@@ -1083,23 +1163,42 @@ def inferred_rows(group_ids, primers, genome_sites, names, opts, existing_pairs,
 PRIMERBANK_URL = 'https://pga.mgh.harvard.edu/cgi-bin/primerbank/new_search2.cgi'
 PRIMERBANK_SPECIES = {'mus musculus': 'Mouse', 'homo sapiens': 'Human'}
 
-# Typical SYBR qPCR design rules (similar to Primer-BLAST / PrimerBank)
+# Typical SYBR qPCR design rules (similar to Primer-BLAST / PrimerBank), with
+# Tm targets set from the annealing temperature by primer3_settings()
 PRIMER3_SETTINGS = {
     'PRIMER_OPT_SIZE': 20, 'PRIMER_MIN_SIZE': 18, 'PRIMER_MAX_SIZE': 25,
-    'PRIMER_OPT_TM': 60.0, 'PRIMER_MIN_TM': 58.0, 'PRIMER_MAX_TM': 63.0,
     'PRIMER_PAIR_MAX_DIFF_TM': 2.0,
     'PRIMER_MIN_GC': 40.0, 'PRIMER_MAX_GC': 60.0, 'PRIMER_MAX_POLY_X': 4,
+    # G or C as the 3'-most base, but no more than 3 G/C in the last 5
+    'PRIMER_GC_CLAMP': 1, 'PRIMER_MAX_END_GC': MAX_END_GC,
     # A junction-spanning primer needs at least this much on each side
     'PRIMER_MIN_3_PRIME_OVERLAP_OF_JUNCTION': 4,
     'PRIMER_MIN_5_PRIME_OVERLAP_OF_JUNCTION': 7,
 }
 
 
+def design_tm_range(opts):
+    """(min, optimum, max) primer Tm for new designs: 2-7 °C above the annealing step"""
+    return opts.anneal + 2, opts.anneal + 4, opts.anneal + 7
+
+
+def primer3_settings(opts):
+    """Primer3 global settings for this run: design rules, Tm targets and reaction conditions"""
+    tm_min, tm_opt, tm_max = design_tm_range(opts)
+    return dict(PRIMER3_SETTINGS,
+                PRIMER_MIN_TM=tm_min, PRIMER_OPT_TM=tm_opt, PRIMER_MAX_TM=tm_max,
+                PRIMER_PRODUCT_SIZE_RANGE=[[opts.min_size, opts.max_size]],
+                PRIMER_SALT_MONOVALENT=TM_CONDITIONS['mv_conc'],
+                PRIMER_SALT_DIVALENT=TM_CONDITIONS['dv_conc'],
+                PRIMER_DNTP_CONC=TM_CONDITIONS['dntp_conc'],
+                PRIMER_DNA_CONC=TM_CONDITIONS['dna_conc'])
+
+
 @dataclass
 class Candidate:
     fwd: str
     rev: str
-    source: str             # 'PrimerBank' or 'Primer3'
+    source: str             # 'Lengthened', 'PrimerBank' or 'Primer3'
     source_id: str = ''
     validated: bool = False  # PrimerBank pair with experimental validation data
     penalty: float = 0.0     # Primer3 pair penalty (lower is better)
@@ -1108,6 +1207,8 @@ class Candidate:
     def label(self):
         if self.source == 'PrimerBank':
             return f"PrimerBank {self.source_id}{' (lab-validated)' if self.validated else ''}"
+        if self.source == 'Lengthened':
+            return f"Your primers, lengthened at the 5' end ({self.source_id})"
         return 'Primer3 design'
 
 
@@ -1197,7 +1298,7 @@ def design_primer3(template, junctions, opts, per_junction=3, per_intron=2):
     """
     if primer3 is None:
         return []
-    settings = dict(PRIMER3_SETTINGS, PRIMER_PRODUCT_SIZE_RANGE=[[opts.min_size, opts.max_size]])
+    settings = primer3_settings(opts)
     runs = []
     for j, intron in junctions:
         runs.append(({'SEQUENCE_OVERLAP_JUNCTION_LIST': [j]}, per_junction))
@@ -1207,15 +1308,75 @@ def design_primer3(template, junctions, opts, per_junction=3, per_intron=2):
     candidates = []
     for extra, n in runs:
         try:
+            # Primer3 can't require a 5' clamp, so ask for extra pairs and filter
             out = primer3.bindings.design_primers(
                 dict({'SEQUENCE_ID': 'target', 'SEQUENCE_TEMPLATE': template}, **extra),
-                dict(settings, PRIMER_NUM_RETURN=n))
+                dict(settings, PRIMER_NUM_RETURN=n * 10 if opts.clamp_5prime else n))
         except Exception:
             continue
+        kept = 0
         for i in range(out.get('PRIMER_PAIR_NUM_RETURNED', 0)):
-            candidates.append(Candidate(out[f'PRIMER_LEFT_{i}_SEQUENCE'], out[f'PRIMER_RIGHT_{i}_SEQUENCE'],
-                                        'Primer3', penalty=out[f'PRIMER_PAIR_{i}_PENALTY']))
+            fwd, rev = out[f'PRIMER_LEFT_{i}_SEQUENCE'], out[f'PRIMER_RIGHT_{i}_SEQUENCE']
+            if opts.clamp_5prime and not (has_clamp(fwd, 5) and has_clamp(rev, 5)):
+                continue
+            candidates.append(Candidate(fwd, rev, 'Primer3', penalty=out[f'PRIMER_PAIR_{i}_PENALTY']))
+            kept += 1
+            if kept == n:
+                break
     return candidates
+
+
+def extend_5prime(seq, site, template, target_tm, clamp_5prime, max_len=28):
+    """
+    Lengthen a primer at its 5' end with the template bases next to its
+    binding site until its Tm reaches target_tm, going up to 3 bases further
+    to end on a 5' G/C if clamp_5prime. None if the target can't be reached.
+    """
+    first = None
+    for n in range(1, max_len - len(seq) + 1):
+        if site.strand == '+':
+            if n > site.start:
+                break
+            longer = template[site.start - n:site.start] + seq
+        else:
+            if site.end + n > len(template):
+                break
+            longer = reverse_complement(template[site.end:site.end + n]) + seq
+        tm = calculate_tm(longer)
+        if tm is None or tm < target_tm:
+            continue
+        if not clamp_5prime or has_clamp(longer, 5):
+            return longer
+        first = first or (n, longer)
+        if n >= first[0] + 3:
+            break
+    return first[1] if first else None
+
+
+def lengthen_pair(fwd, rev, template, opts):
+    """
+    The pair with any primer whose Tm is too low, or too far below its
+    partner's, lengthened at the 5' end along the template. The 3' ends,
+    which decide what gets amplified, are unchanged. None if nothing to do.
+    """
+    ev = evaluate_on_sequence(fwd, rev, template, opts.max_mismatches, opts.exact_3prime, opts.max_product)
+    tms = {'F': calculate_tm(fwd), 'R': calculate_tm(rev)}
+    if not ev.products or None in tms.values():
+        return None
+    product = ev.products[0]
+    sites = {product.left.primer: product.left, product.right.primer: product.right}
+    seqs, changed = {'F': fwd, 'R': rev}, []
+    for key, other in (('F', 'R'), ('R', 'F')):
+        target = max(design_tm_range(opts)[0], tms[other] - PRIMER3_SETTINGS['PRIMER_PAIR_MAX_DIFF_TM'])
+        if tms[key] >= target:
+            continue
+        longer = extend_5prime(seqs[key], sites[key], template, target, opts.clamp_5prime)
+        if longer:
+            changed.append(f"{'Fwd' if key == 'F' else 'Rev'} +{len(longer) - len(seqs[key])} nt")
+            seqs[key] = longer
+    if not changed:
+        return None
+    return Candidate(seqs['F'], seqs['R'], 'Lengthened', source_id=', '.join(changed))
 
 
 def intron_spanning(fwd, rev, template, exons, opts):
@@ -1268,8 +1429,9 @@ def suggest_alternatives(jobs, opts, db):
         exons = map_exons(template, gene.genomic) if template and gene.genomic else []
         bank, bank_error = fetch_primerbank(gene.symbol, opts.organism, opts.cache_dir, opts.refresh)
         designed = design_primer3(template, exon_junctions(exons), opts) if template else []
+        lengthened = lengthen_pair(pair.fwd.seq, pair.rev.seq, template, opts) if template else None
         seen, candidates = {(pair.fwd.seq, pair.rev.seq)}, []
-        for c in bank + designed:
+        for c in ([lengthened] if lengthened else []) + bank + designed:
             if (c.fwd, c.rev) not in seen:
                 seen.add((c.fwd, c.rev))
                 candidates.append(c)
@@ -1315,11 +1477,14 @@ def suggest_alternatives(jobs, opts, db):
             if res['Status'] != 'PASS' or kind >= 2 or pd.notna(res['Genomic_Amplicon_bp']):
                 continue
             amplified, total = (int(x) for x in res['Transcripts_Amplified'].split('/'))
-            # Most isoforms covered first, then lab-validated PrimerBank pairs,
-            # junction-crossing over intron-flanking, PrimerBank over new
-            # designs, lower Primer3 penalty
-            key = (-(amplified / total if total else 0), not c.validated, kind,
-                   c.source != 'PrimerBank', c.penalty)
+            clamped = all(has_clamp(seq, end) for seq in (c.fwd, c.rev)
+                          for end in ((5, 3) if opts.clamp_5prime else (3,)))
+            # Your own primers lengthened first (same assay, just a higher
+            # Tm), then most isoforms covered, lab-validated PrimerBank pairs,
+            # junction-crossing over intron-flanking, G/C clamps, PrimerBank
+            # over new designs, lower Primer3 penalty
+            key = (c.source != 'Lengthened', -(amplified / total if total else 0), not c.validated,
+                   kind, not clamped, c.source != 'PrimerBank', c.penalty)
             scored.append((key, c, res, how, product))
         scored.sort(key=lambda x: x[0])
 
@@ -1357,6 +1522,10 @@ def suggest_alternatives(jobs, opts, db):
                 'Rev_Primer': c.rev,
                 'Fwd_Tm_C': res['Fwd_Tm_C'],
                 'Rev_Tm_C': res['Rev_Tm_C'],
+                'Fwd_Tm_2+4_C': res['Fwd_Tm_2+4_C'],
+                'Rev_Tm_2+4_C': res['Rev_Tm_2+4_C'],
+                'Fwd_GC_Clamp': res['Fwd_GC_Clamp'],
+                'Rev_GC_Clamp': res['Rev_GC_Clamp'],
                 'Fwd_GC%': res['Fwd_GC%'],
                 'Rev_GC%': res['Rev_GC%'],
                 'Notes': res['Notes'],
@@ -1525,6 +1694,8 @@ def validate(primers, opts):
         'Length': p.stats.get('length'),
         'GC%': p.stats.get('gc_content'),
         'Tm_C': p.stats.get('tm'),
+        'Tm_2+4_C': p.stats.get('tm_wallace'),
+        'GC_Clamp': p.stats.get('clamp'),
         'Binding': p.binding,
     } for p in primers])
     return pairs_df, primers_df, unpaired, alternatives
@@ -1585,11 +1756,17 @@ def write_report(pairs_df, primers_df, output_file, opts, alternatives=None):
         ("3' bases that must match (genome search)", opts.anchor),
         ('Genome-wide off-target check', 'yes' if opts.genome_check else 'no'),
         ('Suggest alternatives', f'yes, up to {opts.suggest_count} per pair' if opts.suggest else 'no'),
+        ('Annealing temperature', f'{opts.anneal:g} °C (primers below it WARN)'),
+        ('Max Tm difference within a pair', f'{opts.max_tm_diff:g} °C'),
+        ('Design Tm range', '{:g}-{:g} °C (optimum {:g})'.format(*(design_tm_range(opts)[i] for i in (0, 2, 1)))),
+        ("5' G/C clamp on new designs", 'required' if opts.clamp_5prime else 'not required'),
         ('Primer3 design settings', ', '.join(f'{k.replace("PRIMER_", "")}={v}'
-                                              for k, v in PRIMER3_SETTINGS.items())),
+                                              for k, v in primer3_settings(opts).items())),
         ('Genome assembly', opts.genome_db or UCSC_DBS.get(opts.organism.lower(), '')),
         ('Tm method', 'Primer3 nearest-neighbour (SantaLucia 1998); '
-                      '50 mM Na+, 1.5 mM Mg2+, 0.6 mM dNTP, 50 nM oligo'),
+                      f"{TM_CONDITIONS['mv_conc']:g} mM K+, {TM_CONDITIONS['dv_conc']:g} mM Mg2+, "
+                      f"{TM_CONDITIONS['dntp_conc']:g} mM dNTP, {TM_CONDITIONS['dna_conc']:g} nM primer. "
+                      'Tm_2+4 columns: 2 °C per A/T + 4 °C per G/C, for comparison'),
     ], columns=['Setting', 'Value'])
 
     with pd.ExcelWriter(output_file, engine='openpyxl') as writer:
@@ -1652,6 +1829,18 @@ Environment:
                         help="3' bases that must match exactly in gene checks (default 5)")
     parser.add_argument('--anchor', type=int, default=15,
                         help="3' bases that must match exactly in genome searches (default 15)")
+    parser.add_argument('--anneal', type=float, default=60,
+                        help='Annealing/extension temperature of your qPCR program; primers with a '
+                             'lower Tm WARN (default 60)')
+    parser.add_argument('--max-tm-diff', type=float, default=5,
+                        help='Largest Tm difference between the two primers of a pair before it '
+                             'WARNs (default 5)')
+    parser.add_argument('--mg', type=float, default=TM_CONDITIONS['dv_conc'],
+                        help=f"Mg2+ (mM) in your mastermix, for Tm (default {TM_CONDITIONS['dv_conc']:g})")
+    parser.add_argument('--primer-conc', type=float, default=TM_CONDITIONS['dna_conc'],
+                        help=f"Concentration of each primer (nM), for Tm (default {TM_CONDITIONS['dna_conc']:g})")
+    parser.add_argument('--no-5prime-clamp', dest='clamp_5prime', action='store_false',
+                        help="Don't require a G/C at the 5' end of new designs and lengthened primers")
     parser.add_argument('--flank', type=int, default=1000,
                         help='bp either side of the gene included in its genomic region (default 1000)')
     parser.add_argument('--genome-check', action='store_true',
@@ -1670,6 +1859,7 @@ Environment:
 
 def main():
     opts = build_parser().parse_args()
+    set_tm_conditions(opts.mg, opts.primer_conc)
 
     input_file = opts.input_file or select_input_file()
     if not os.path.exists(input_file):

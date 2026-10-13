@@ -46,6 +46,10 @@ The wrapper works from any directory (e.g. `~/Dropbox/git-repos/primer_validatio
 | `--max-mismatches` | 1 | Mismatches tolerated per primer. Any mismatch makes the pair WARN |
 | `--exact-3prime` | 5 | 3′ bases that must match exactly (gene checks) |
 | `--anchor` | 15 | 3′ bases that must match exactly (genome searches, as in UCSC isPCR) |
+| `--anneal` | 60 | Annealing/extension temperature of your qPCR program (°C). Primers with a lower Tm WARN, and new designs aim 2–7 °C above it |
+| `--max-tm-diff` | 5 | Largest Tm difference between the two primers of a pair before it WARNs |
+| `--mg` / `--primer-conc` | 3 / 250 | Mg²⁺ (mM) and each primer's concentration (nM) in your reaction, used for every Tm |
+| `--no-5prime-clamp` | off | Don't require a 5′ G/C on new designs and lengthened primers |
 | `--flank` | 1000 | bp either side of the gene included in its genomic region |
 | `--genome-check` | off | Genome-wide off-target search. The first run downloads the genome (~800 MB for mouse) |
 | `--genome-db` | from organism | UCSC assembly (`mm39`, `rn7`, `hg38`, `danRer11`, `galGal6`, `dm6`) |
@@ -96,14 +100,19 @@ With `--suggest`, the tool looks for replacements for any gene pair that doesn't
 Candidates come from two places:
 
 - **[Harvard PrimerBank](https://pga.mgh.harvard.edu/primerbank/)**: published qPCR pairs for mouse and human genes. Some were tested in the lab, and these are marked *lab-validated*.
-- **Primer3 designs**: pairs designed around each exon junction of the transcript your primers target. Either one primer crosses an exon–exon junction (so it can't prime genomic DNA), or the primers sit either side of an intron longer than `--max-product`. The design rules are typical SYBR qPCR ones: 18–25 nt, Tm 58–63 °C within 2 °C of each other, GC 40–60%, no runs over 4 bases, and a product inside your `--min-size`/`--max-size` window.
+- **Your own primers, lengthened**: if a primer's Tm is too low, or more than 2 °C below its partner's, it is extended at the 5′ end with the bases next to its binding site, up to 28 nt. The 3′ end, which decides what gets amplified, stays the same, so it is the same assay with a higher Tm. It stops at a 5′ G or C where it can, within 3 bases of reaching the target Tm.
+- **Primer3 designs**: pairs designed around each exon junction of the transcript your primers target. Either one primer crosses an exon–exon junction (so it can't prime genomic DNA), or the primers sit either side of an intron longer than `--max-product`. The design rules are typical SYBR qPCR ones: 18–25 nt, Tm 2–7 °C above `--anneal` (62–67 °C by default) within 2 °C of each other, GC 40–60%, no runs over 4 bases, and a product inside your `--min-size`/`--max-size` window. Both ends of each primer must be G or C, with no more than 3 G/C in the last 5 bases at the 3′ end (`--no-5prime-clamp` drops the 5′ rule).
 
 Every candidate goes through the same checks as your primers: all transcripts, the genomic region, and the genome with `--genome-check`. Only those that **PASS with no genomic DNA product** are offered. They're ranked by:
-1. most isoforms amplified;
-2. lab-validated PrimerBank pairs;
-3. junction-crossing over intron-flanking;
-4. PrimerBank over new designs;
-5. Primer3's quality score.
+1. your own primers lengthened (same assay, only a higher Tm);
+2. most isoforms amplified;
+3. lab-validated PrimerBank pairs;
+4. junction-crossing over intron-flanking;
+5. G/C clamps on both ends;
+6. PrimerBank over new designs;
+7. Primer3's quality score.
+
+A lengthened pair is only offered if it passes cleanly. If your primers don't span an intron, lengthening won't fix that, so you get the other options instead.
 
 Options never share a primer position, so you get genuinely different assays. Genes with few exons may get fewer than three.
 
@@ -127,7 +136,9 @@ An Excel file with three sheets, plus an Alternatives sheet with `--suggest`. By
 | **Transcripts_Amplified** | e.g. `7/9` |
 | **Genomic_Amplicon_bp** | Product on genomic DNA (blank = primers span an intron/junction) |
 | **Genome_Products** | With `--genome-check`: on-target / off-target products and locations |
-| **Fwd/Rev_Primer, _Length, _GC%, _Tm_C** | Primer properties |
+| **Fwd/Rev_Primer, _Length, _GC%, _Tm_C** | Primer properties. Tm is nearest-neighbour at your reaction conditions (see *Tm* below) |
+| **Fwd/Rev_Tm_2+4_C** | Tm by the 2+4 rule (2 °C per A/T, 4 °C per G/C), for comparison only |
+| **Fwd/Rev_GC_Clamp** | Which ends are G/C (`both ends`, `3' only`…), and whether the 3′ end is GC-rich (more than 3 of the last 5) |
 | **Fwd/Rev_Mismatches** | Mismatches at the sites used for the product |
 
 ### Alternatives
@@ -150,7 +161,7 @@ The parameters used for the run, for your records.
 ### Status meanings
 
 - **PASS**: product on the gene's transcript(s) within the size window. No mismatches, no extra products, no off-target products found.
-- **WARN**: a product forms, but something needs a look. Possible reasons: size outside the window, a mismatch, several products, product only on genomic DNA, or off-target genome products. The *Problem* column says what to check.
+- **WARN**: a product forms, but something needs a look. Possible reasons: size outside the window, a mismatch, several products, product only on genomic DNA, off-target genome products, a primer Tm below `--anneal`, or primer Tms more than `--max-tm-diff` apart. A missing 3′ G/C clamp is mentioned in *Notes* but doesn't cause a WARN. The *Problem* column says what to check.
 - **FAIL**: no product. *Problem* says whether one primer doesn't bind, or both bind but can't form a product.
 - **ERROR**: the gene couldn't be found or fetched, or a sequence has invalid characters.
 - **INFERRED**: a product predicted between primers that weren't named as a pair (chromosome-locus sets; also unpartnered primers with `--genome-check`).
@@ -163,7 +174,9 @@ For **chromosome-locus** pairs the qPCR size window isn't applied. They PASS if 
 2. **Binding**: both strands are searched. The 3′-most bases must match exactly, and up to `--max-mismatches` are tolerated elsewhere.
 3. **Products**: any forward-facing site followed by a reverse-facing site within `--max-product` bp. This also catches single-primer products and swapped Fwd/Rev names.
 4. **Genome**: chromosomes are downloaded once from UCSC (`hgdownload`) and searched locally. This covers chromosome loci, and every chromosome with `--genome-check`.
-5. **Tm**: nearest-neighbour model (SantaLucia 1998) via Primer3, at Primer3 default conditions (50 mM Na⁺, 1.5 mM Mg²⁺, 0.6 mM dNTPs, 50 nM oligo). Expect values a few °C different from IDT OligoAnalyzer, which uses different default conditions.
+5. **Tm**: nearest-neighbour model (SantaLucia 1998) via Primer3, at typical SYBR mastermix conditions: 50 mM K⁺, 3 mM Mg²⁺ (`--mg`), 0.8 mM dNTPs, 250 nM each primer (`--primer-conc`). These read about 4 °C higher than Primer3's or Primer-BLAST's defaults (1.5 mM Mg²⁺, 50 nM primer), so a primer at 60 °C there is about 64 °C here.
+   - The 2+4 rule is shown alongside for comparison. It was derived for short oligos (14 nt or less), ignores base order and salt, and usually reads higher than nearest-neighbour for 18–25-mers.
+   - A primer with a nearest-neighbour Tm of 62–66 °C here suits a standard 95 °C → 60 °C qPCR program.
 
 ### Limitations
 
