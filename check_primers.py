@@ -396,9 +396,10 @@ def chromosome_of(base):
 
 
 def gene_symbol_candidates(base):
-    """Symbols to try in NCBI Gene: the full base name, then its first token"""
+    """Symbols to try in NCBI Gene: the full base name, then its first token
+    ('Mitf-M' -> 'Mitf-M', 'Mitf')"""
     candidates = [base]
-    first = base.split('_')[0]
+    first = NAME_SEP_RE.split(base)[0]
     if first and first != base:
         candidates.append(first)
     return candidates
@@ -648,11 +649,25 @@ def resolve_isoforms(gene, isoforms):
     return list(dict.fromkeys(found)), missing
 
 
+def isoform_label(base, gene):
+    """
+    The isoform named in a primer name by a hyphen after the gene:
+    'Mitf-M' -> 'M'. Such a pair targets particular isoforms, so it isn't
+    expected to amplify them all. '' for a plain gene name ('Mitf', 'Tyr_Pro')
+    or a symbol that itself contains a hyphen ('H2-K1').
+    """
+    head = re.split(r'[_\s.]', base)[0]
+    symbol, sep, label = head.partition('-')
+    if not sep or not label or head.lower() == gene.symbol.lower() or symbol.lower() != gene.symbol.lower():
+        return ''
+    return label
+
+
 def _list_accs(accs, limit=6):
     return ', '.join(accs[:limit]) + (f' and {len(accs) - limit} more' if len(accs) > limit else '')
 
 
-def isoform_coverage(gene, amplified, targets=None):
+def isoform_coverage(gene, amplified, targets=None, label=''):
     """
     Which transcripts a pair should amplify, and how well it does.
     Catch-all (no targets): every curated (NM_/NR_) transcript, so a pair
@@ -663,21 +678,25 @@ def isoform_coverage(gene, amplified, targets=None):
     """
     amplified = set(amplified)
     curated = set(curated_transcripts(gene))
-    others = [acc for acc, _ in gene.transcripts if acc not in amplified]
+    others = [acc for acc, _ in gene.transcripts if acc not in amplified]   # ranking only
     sym, problems, notes = gene.symbol, [], []
+    if label and not targets:
+        # Named in the primer name only: report the hits, nothing to enforce
+        hits = [acc for acc, _ in gene.transcripts if acc in curated and acc in amplified]
+        notes.append(f'Targets isoform {sym}-{label} (from the name): amplifies {len(hits)} of '
+                     f'{len(curated)} curated transcripts ({_list_accs(hits)}). Check these are '
+                     f'the {sym}-{label} transcripts')
+        return problems, notes, (0, 0), (0, 0)
     if not targets:
         missed = [acc for acc, _ in gene.transcripts if acc in curated and acc not in amplified]
         if missed:
             problems.append(f"Misses {len(missed)} of {len(curated)} curated {sym} transcripts "
                             f"({_list_accs(missed)}): won't measure all {sym} mRNA. If you want "
                             f"specific isoforms, list them in an Isoform column")
-        elif len(gene.transcripts) == 1:
-            notes.append(f'{sym} has one RefSeq transcript')
-        elif not others:
-            notes.append(f'Amplifies all {len(gene.transcripts)} {sym} transcripts')
+        elif len(curated) == 1:
+            notes.append(f'{sym} has one curated RefSeq transcript')
         else:
-            notes.append(f'Amplifies all {len(curated)} curated {sym} transcripts; misses predicted '
-                         f'{_list_accs(others)}')
+            notes.append(f'Amplifies all {len(curated)} curated {sym} transcripts')
         return problems, notes, (len(missed), 0), (len(missed), len(others))
     missed = [t for t in targets if t not in amplified]
     extra = [acc for acc, _ in gene.transcripts if acc in amplified and acc not in targets]
@@ -687,8 +706,7 @@ def isoform_coverage(gene, amplified, targets=None):
     if extra_curated:
         problems.append(f'Not isoform-specific: also amplifies {_list_accs(extra_curated)}')
     if not missed and not extra_curated:
-        notes.append(f"Specific to {_list_accs(targets)}"
-                     + (f' (also predicted {_list_accs(extra)})' if extra else ''))
+        notes.append(f'Specific to {_list_accs(targets)}')
     return (problems, notes, (len(missed), len(extra_curated)),
             (len(missed), len(extra_curated), len(extra)))
 
@@ -1038,10 +1056,12 @@ def tm_and_clamp_checks(fwd, rev, opts):
     return problems, notes
 
 
-def evaluate_gene_pair(fwd, rev, gene, opts, genome=None, isoforms=()):
+def evaluate_gene_pair(fwd, rev, gene, opts, genome=None, isoforms=(), label=''):
     """
     Check a fwd/rev pair against a gene's transcripts and genomic region.
     isoforms: transcripts the pair should be specific to (empty = catch-all).
+    label: an isoform named in the primer name (Mitf-M -> 'M'), which turns
+    off the catch-all check when no isoforms are given.
     """
     result = blank_result(fwd, rev, gene.symbol)
     if gene.description:
@@ -1053,7 +1073,8 @@ def evaluate_gene_pair(fwd, rev, gene, opts, genome=None, isoforms=()):
     if unknown:
         warnings.append(f"Isoform {_list_accs(unknown)} isn't a RefSeq transcript of {gene.symbol}: "
                         f"check the accession" + ('' if targets else '. Checked as catch-all instead'))
-    result['Isoforms'] = _list_accs(targets, 99) if targets else 'All (catch-all)'
+    result['Isoforms'] = (_list_accs(targets, 99) if targets else
+                          f'{gene.symbol}-{label} (from the name)' if label else 'All (catch-all)')
 
     def run(seq):
         return evaluate_on_sequence(fwd.seq, rev.seq, seq, opts.max_mismatches,
@@ -1062,9 +1083,13 @@ def evaluate_gene_pair(fwd, rev, gene, opts, genome=None, isoforms=()):
     tx_results = [(acc, run(seq)) for acc, seq in gene.transcripts]
     gen = run(gene.genomic) if gene.genomic else None
     amplified = [(acc, r) for acc, r in tx_results if r.products]
-    result['Transcripts_Amplified'] = f'{len(amplified)}/{len(tx_results)}'
+    # Counts and lists cover curated transcripts only: predicted XM_/XR_
+    # ones are often never confirmed
+    curated = curated_transcripts(gene)
+    shown = [(acc, r) for acc, r in amplified if acc in curated]
+    result['Transcripts_Amplified'] = f'{len(shown)}/{len(curated)}'
     result['Matched_Transcripts'] = '; '.join(
-        f"{acc} ({', '.join(str(p.size) for p in r.products)} bp)" for acc, r in amplified)
+        f"{acc} ({', '.join(str(p.size) for p in r.products)} bp)" for acc, r in shown)
     if gen and gen.products:
         result['Genomic_Amplicon_bp'] = gen.products[0].size
 
@@ -1098,7 +1123,7 @@ def evaluate_gene_pair(fwd, rev, gene, opts, genome=None, isoforms=()):
         if len(sizes) > 1:
             notes.append(f"Product size differs between isoforms ({', '.join(map(str, sorted(sizes)))} bp)")
         cov_problems, cov_notes, result['_coverage'], result['_coverage_rank'] = isoform_coverage(
-            gene, [acc for acc, _ in amplified], targets)
+            gene, [acc for acc, _ in amplified], targets, label)
         warnings.extend(cov_problems)
         notes.extend(cov_notes)
         result['_coverage_problems'] = len(cov_problems)
@@ -1567,13 +1592,13 @@ def describe_alternative(alt):
 
 def suggest_alternatives(jobs, opts, db):
     """
-    For each (pair, gene, row) whose primers have a problem, gather PrimerBank and Primer3 candidates, check each one exactly
+    For each (pair, gene, row, target isoforms) whose primers have a problem, gather PrimerBank and Primer3 candidates, check each one exactly
     as the original pairs are checked, and return the best as rows. The top
     one is also written into the pair's own row (Suggested_Alternative).
     """
     prepared = []
-    for pair, gene, row in jobs:
-        targets = resolve_isoforms(gene, pair.isoforms)[0]
+    for pair, gene, row, isoforms in jobs:
+        targets = resolve_isoforms(gene, isoforms)[0]
         seqs = dict(gene.transcripts)
         if targets:
             acc = min(targets, key=_accession_rank)
@@ -1793,12 +1818,18 @@ def validate(primers, opts):
                 if opts.genome_check and not genome_error:
                     genome = (genome_products([f_idx, r_idx], genome_sites, opts.max_product),
                               names, {f_idx, r_idx} & saturated)
-                row = evaluate_gene_pair(fwd, rev, gene, opts, genome, pair.isoforms)
+                # Target isoforms come from the Isoform column; a name such as
+                # Mitf-M_Fwd just says the pair isn't meant to be a catch-all
+                isoforms, label = pair.isoforms, isoform_label(fwd.base, gene)
+                row = evaluate_gene_pair(fwd, rev, gene, opts, genome, isoforms, label)
+                if label and not isoforms:
+                    # Alternatives aim for the same curated transcripts as this pair
+                    isoforms = ACCESSION_RE.findall(row['Matched_Transcripts'])
                 # Skip pairs only matched by row position with different names
                 # (e.g. promoter/enhancer genotyping primers): not a gene qPCR assay
                 same_target = pair.how != 'adjacent' or fwd.base.lower() == rev.base.lower()
                 if opts.suggest and same_target and needs_alternatives(row):
-                    suggest_jobs.append((pair, gene, row))
+                    suggest_jobs.append((pair, gene, row, isoforms))
         # Naming problems go first: they are the thing to fix before ordering
         name_problems = [t for t in (warning, pair.note if pair.how == 'typo' else None) if t]
         if name_problems:

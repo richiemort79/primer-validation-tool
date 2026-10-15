@@ -5,6 +5,9 @@
 ### Isoforms
 - Gene pairs are checked as catch-all by default: a pair that misses any curated (NM_/NR_) transcript now WARNs and names it. Missed predicted (XM_/XR_) transcripts are only noted
 - New optional `Isoform` (or `Transcript`) column: list RefSeq accessions to make a pair isoform-specific (e.g. Mitf-M: NM_008601, NM_001410059). It WARNs if it misses a target or amplifies another curated transcript
+- A hyphen after the gene in a primer name (`Mitf-M_Fwd`, `MITF-M_For`) marks the pair as isoform-targeted, so Sigma/IDT upload sheets work unchanged: no catch-all WARN, Notes lists the curated transcripts it amplifies, and `--suggest` aims for the same ones
+- `Transcripts_Amplified` and `Matched_Transcripts` count curated transcripts only; predicted XM_/XR_ transcripts are ignored (e.g. Glis3 shows 3/3, not 4/7)
+- Gene lookup also tries the part of the name before a `-` (`MITF-M` -> MITF)
 - New `Isoforms` column on the Pairs and Alternatives sheets
 
 ### Suggestions

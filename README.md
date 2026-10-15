@@ -2,7 +2,7 @@
 
 A Python script that checks PCR primers in silico before you order them or run them:
 
-- **Gene-targeted pairs** (e.g. `Mitf_Fwd` / `Mitf_Rev`) are tested against **every RefSeq transcript** of the gene and against the gene's **genomic region**, using NCBI. You get the amplicon size, which isoforms it amplifies, and whether it spans an intron (no genomic DNA product). By default a pair should amplify every isoform (catch-all); add an **Isoform** column to target specific ones, such as Mitf-M.
+- **Gene-targeted pairs** (e.g. `Mitf_Fwd` / `Mitf_Rev`) are tested against **every RefSeq transcript** of the gene and against the gene's **genomic region**, using NCBI. You get the amplicon size, which isoforms it amplifies, and whether it spans an intron (no genomic DNA product). By default a pair should amplify every curated isoform (catch-all). To target specific isoforms, add the isoform to the primer name (`Mitf-M_Fwd`) or list accessions in an **Isoform** column.
 - **Chromosome-locus primers** (e.g. `Chr1_L_Flank`, `Chr1_R_Int`) are located on that chromosome, on both strands. Every product they can form with each other is reported, so you don't need Fwd/Rev names for genotyping primer sets.
 - **Optional genome-wide check** (`--genome-check`) searches the whole genome for off-target products, similar to UCSC In-Silico PCR.
 - **Optional suggestions** (`--suggest`): for pairs that WARN or FAIL, it proposes better pairs from Harvard PrimerBank and new Primer3 designs. Each one is checked exactly like your own primers.
@@ -72,9 +72,11 @@ Inline modification codes (`/5Phos/`, `[Btn]`), whitespace and lower case are cl
 
 ### Isoforms: catch-all or specific
 
-By default each gene pair is checked as a **catch-all**: it should amplify every curated RefSeq transcript of the gene (NM_ and NR_), so it measures all of that gene's mRNA. A pair that misses one gets a WARN naming the missed transcripts. Predicted transcripts (XM_/XR_) are only mentioned in *Notes*, since many are never confirmed.
+By default each gene pair is checked as a **catch-all**: it should amplify every curated RefSeq transcript of the gene (NM_ and NR_), so it measures all of that gene's mRNA. A pair that misses one gets a WARN naming the missed transcripts. Predicted transcripts (XM_/XR_) are ignored, since many are never confirmed: counts such as `3/3` and the transcript lists cover curated transcripts only. (A gene with no curated transcripts is counted over all of them.)
 
-To target specific isoforms, add a column whose header contains **Isoform** (or **Transcript**) and list the RefSeq accessions there, separated by commas. The version (`.4`) is optional, and filling it in for either primer of the pair is enough:
+**In the primer name.** Put a hyphen and the isoform straight after the gene name: `Mitf-M_Fwd`, `MITF-M_For`. This works with Sigma/IDT upload sheets as they are. It tells the tool the pair is meant for particular isoforms, so it isn't checked as a catch-all. The tool can't know which transcripts "M" means, so it doesn't WARN about coverage. *Notes* lists the curated transcripts the pair amplifies (e.g. `amplifies 2 of 12 curated transcripts (NM_001410059.1, NM_008601.4)`) for you to confirm they're the ones you meant. With `--suggest`, alternatives aim for that same set of transcripts. Only a hyphen counts: `Tyr_Pro_For` is still a catch-all, and gene symbols that contain a hyphen (`H2-K1`) are read as the gene.
+
+**In an Isoform column.** To have the tool check exact transcripts, add a column whose header contains whose header contains **Isoform** (or **Transcript**) and list the RefSeq accessions there, separated by commas. The version (`.4`) is optional, and filling it in for either primer of the pair is enough:
 
 | Name | Sequence | Isoform |
 |------|----------|---------|
@@ -143,13 +145,13 @@ An Excel file with three sheets, plus an Alternatives sheet with `--suggest`. By
 |--------|-------------|
 | **Pair** | `Fwd name + Rev name` |
 | **Target** | Gene symbol and description, or chromosome |
-| **Isoforms** | `All (catch-all)`, or the target transcripts from the Isoform column |
+| **Isoforms** | `All (catch-all)`, the isoform from the name (`Mitf-M (from the name)`), or the target transcripts from the Isoform column |
 | **Status** | PASS / WARN / FAIL / ERROR / INFERRED (see below) |
 | **Problem** | What is wrong and what to do about it. Blank for PASS; several problems are numbered |
 | **Amplicon_Size_bp** | Product size on the first amplified transcript (NM_ preferred) |
 | **Notes** | Information only: product size, transcripts amplified, whether it spans an intron |
-| **Matched_Transcripts** | Every RefSeq transcript amplified, with sizes |
-| **Transcripts_Amplified** | e.g. `7/9` |
+| **Matched_Transcripts** | Every curated RefSeq transcript (NM_/NR_) amplified, with sizes |
+| **Transcripts_Amplified** | Curated transcripts amplified, e.g. `3/3` |
 | **Genomic_Amplicon_bp** | Product on genomic DNA (blank = primers span an intron/junction) |
 | **Genome_Products** | With `--genome-check`: on-target / off-target products and locations |
 | **Fwd/Rev_Primer, _Length, _GC%, _Tm_C** | Primer properties. Tm is nearest-neighbour at your reaction conditions (see *Tm* below) |

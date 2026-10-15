@@ -250,7 +250,7 @@ def test_isoform_coverage_catch_all():
     gene, _ = _isoform_gene()
     problems, notes, score, _ = cp.isoform_coverage(gene, ['NM_1.1', 'NM_2.1', 'NM_3.1'])
     assert problems == [] and score == (0, 0)
-    assert 'misses predicted XM_4.1' in notes[0]               # predicted ones only noted
+    assert notes == ['Amplifies all 3 curated Gx transcripts']   # predicted XM_4 ignored
     problems, _, score, _ = cp.isoform_coverage(gene, ['NM_1.1', 'NM_2.1'])
     assert score == (1, 0) and 'Misses 1 of 3 curated Gx transcripts (NM_3.1)' in problems[0]
 
@@ -260,7 +260,7 @@ def test_isoform_coverage_specific():
     targets, unknown = cp.resolve_isoforms(gene, ['NM_1', 'NM_2.5', 'NM_9'])
     assert targets == ['NM_1.1', 'NM_2.1'] and unknown == ['NM_9']   # version ignored
     problems, notes, score, _ = cp.isoform_coverage(gene, ['NM_1.1', 'NM_2.1', 'XM_4.1'], targets)
-    assert problems == [] and score == (0, 0) and 'also predicted XM_4.1' in notes[0]
+    assert problems == [] and score == (0, 0) and notes == ['Specific to NM_1.1, NM_2.1']
     problems, _, score, _ = cp.isoform_coverage(gene, ['NM_1.1', 'NM_3.1'], targets)
     assert score == (1, 1)
     assert "Doesn't amplify target isoform NM_2.1" in problems[0]
@@ -289,10 +289,38 @@ def test_evaluate_gene_pair_isoforms():
         p.stats = cp.calculate_primer_stats(p.seq)
     res = cp.evaluate_gene_pair(f, r, gene, _Opts)
     assert res['Isoforms'] == 'All (catch-all)' and res['Status'] == 'WARN'
+    # Counts and lists are curated only: XM_4 is amplified but not shown
+    assert res['Transcripts_Amplified'] == '2/3'
+    assert 'XM_4' not in res['Matched_Transcripts']
     assert any('Misses 1 of 3' in t for t in res['Problem'])
     res = cp.evaluate_gene_pair(f, r, gene, _Opts, isoforms=['NM_1.1', 'NM_2.1'])
     assert res['Isoforms'] == 'NM_1.1, NM_2.1'
     assert not any('isoform' in t.lower() for t in res['Problem'])
+
+
+def test_isoform_label_from_name():
+    gene, _ = _isoform_gene()
+    assert cp.isoform_label('Gx-A', gene) == 'A'
+    assert cp.isoform_label('GX-a_Pro', gene) == 'a'
+    for base in ('Gx', 'Gx_A', 'Gx_Pro', 'Other-A'):     # only a hyphen after the gene counts
+        assert cp.isoform_label(base, gene) == ''
+    hyphenated = cp.GeneRecord('H2-K1', '1', '', '', None, None, None, [], None, 1000)
+    assert cp.isoform_label('H2-K1', hyphenated) == ''
+
+
+def test_isoform_coverage_named_in_primer_name():
+    gene, _ = _isoform_gene()
+    problems, notes, score, _ = cp.isoform_coverage(gene, ['NM_1.1', 'NM_2.1', 'XM_4.1'], label='A')
+    assert problems == [] and score == (0, 0)                 # no catch-all WARN
+    assert 'Targets isoform Gx-A (from the name): amplifies 2 of 3 curated transcripts (NM_1.1, NM_2.1)' in notes[0]
+    # Accessions from an Isoform column still take precedence
+    problems, _, _, _ = cp.isoform_coverage(gene, ['NM_1.1'], ['NM_1.1', 'NM_2.1'], label='A')
+    assert problems
+
+
+def test_gene_symbol_candidates_hyphen():
+    assert cp.gene_symbol_candidates('MITF-M') == ['MITF-M', 'MITF']
+    assert cp.gene_symbol_candidates('Tyr_Pro') == ['Tyr_Pro', 'Tyr']
 
 
 # --- Alternative primers (--suggest) -------------------------------------------
