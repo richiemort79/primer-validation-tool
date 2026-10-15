@@ -80,7 +80,7 @@ DIRECTION_LETTER_RE = re.compile(r'(?P<dir>[fr])(?P<num>\d*)', re.IGNORECASE)
 # Only an exact chromosome token counts, so genes such as Chrm1, Chrna7 or
 # Chrd are still treated as genes.
 CHROM_RE = re.compile(r'^chr(?P<chrom>\d+|X|Y|M|MT)$', re.IGNORECASE)
-# RefSeq transcript accessions, version optional, in an Isoform column
+# RefSeq transcript accessions, e.g. in Matched_Transcripts
 ACCESSION_RE = re.compile(r'\b[NX][MR]_\d+(?:\.\d+)?\b')
 
 # Tm conditions (Primer3 calc_tm keywords): a typical SYBR qPCR mastermix,
@@ -328,7 +328,6 @@ class Primer:
     error: str = None
     paired_with: list = field(default_factory=list)
     binding: str = ''
-    isoforms: list = field(default_factory=list)   # target transcripts from an Isoform column
 
     @property
     def pair_key(self):
@@ -406,22 +405,14 @@ def gene_symbol_candidates(base):
 
 
 def _find_columns(raw):
-    """Locate the header row, the name/sequence columns and an optional
-    Isoform (or Transcript) column"""
+    """Locate the header row and the name/sequence columns"""
     for i in range(min(30, len(raw))):
         cells = [str(c).lower() if pd.notna(c) else '' for c in raw.iloc[i]]
         seq_col = next((j for j, c in enumerate(cells) if 'sequence' in c), None)
         name_col = next((j for j, c in enumerate(cells) if 'name' in c), None)
         if seq_col is not None and name_col is not None:
-            iso_col = next((j for j, c in enumerate(cells) if j not in (seq_col, name_col)
-                            and ('isoform' in c or 'transcript' in c)), None)
-            return i, name_col, seq_col, iso_col
-    return None, 0, 2, None  # no header found: IDT layout, column A / column C
-
-
-def parse_isoforms(text):
-    """RefSeq accessions in an Isoform cell: 'NM_008601.4, NM_001410059' -> list"""
-    return ACCESSION_RE.findall(str(text).upper()) if pd.notna(text) else []
+            return i, name_col, seq_col
+    return None, 0, 2  # no header found: IDT layout, column A / column C
 
 
 def load_primers(filepath, sheet=None):
@@ -437,7 +428,7 @@ def load_primers(filepath, sheet=None):
         raw = pd.read_excel(filepath, sheet_name=sheet if sheet is not None else 0,
                             header=None, dtype=str)
 
-    header_row, name_col, seq_col, iso_col = _find_columns(raw)
+    header_row, name_col, seq_col = _find_columns(raw)
     first_row = 0 if header_row is None else header_row + 1
 
     primers = []
@@ -452,8 +443,7 @@ def load_primers(filepath, sheet=None):
         name = str(raw_name).strip() if pd.notna(raw_name) and str(raw_name).strip() else f'Row{idx + 1}'
         base, direction, num, tag = parse_primer_name(name)
         primer = Primer(name=name, seq=seq, row=idx + 1, base=base, direction=direction,
-                        pair_num=num, tag=tag, chrom=chromosome_of(base),
-                        isoforms=parse_isoforms(raw.iat[idx, iso_col]) if iso_col is not None else [])
+                        pair_num=num, tag=tag, chrom=chromosome_of(base))
         bad = invalid_bases(seq)
         if bad:
             primer.error = f"Invalid characters in sequence: {''.join(bad)}"
@@ -470,11 +460,6 @@ class PrimerPair:
     rev: Primer
     how: str = 'name'   # 'name', 'adjacent' (neighbouring rows) or 'typo'
     note: str = ''
-
-    @property
-    def isoforms(self):
-        """Target transcripts given for either primer; empty means all (catch-all)"""
-        return list(dict.fromkeys(self.fwd.isoforms + self.rev.isoforms))
 
 
 def pair_primers(primers):
@@ -628,25 +613,10 @@ def _accession_rank(acc):
     return (order.get(acc[:2], 4), acc)
 
 
-def unversioned(acc):
-    return acc.split('.')[0]
-
-
 def curated_transcripts(gene):
     """The gene's curated RefSeq transcripts (NM_/NR_); all of them if it has none"""
     accs = [acc for acc, _ in gene.transcripts]
     return [a for a in accs if a[:2] in ('NM', 'NR')] or accs
-
-
-def resolve_isoforms(gene, isoforms):
-    """Match Isoform-column accessions (version optional) to the gene's
-    transcripts. Returns (matched accessions, accessions not found)."""
-    by_base = {unversioned(acc): acc for acc, _ in gene.transcripts}
-    found, missing = [], []
-    for a in isoforms:
-        acc = by_base.get(unversioned(a))
-        (found if acc else missing).append(acc or a)
-    return list(dict.fromkeys(found)), missing
 
 
 def isoform_label(base, gene):
@@ -691,8 +661,8 @@ def isoform_coverage(gene, amplified, targets=None, label=''):
         missed = [acc for acc, _ in gene.transcripts if acc in curated and acc not in amplified]
         if missed:
             problems.append(f"Misses {len(missed)} of {len(curated)} curated {sym} transcripts "
-                            f"({_list_accs(missed)}): won't measure all {sym} mRNA. If you want "
-                            f"specific isoforms, list them in an Isoform column")
+                            f"({_list_accs(missed)}): won't measure all {sym} mRNA. If the pair is "
+                            f"meant for particular isoforms, name the primers {sym}-<isoform>_Fwd/_Rev")
         elif len(curated) == 1:
             notes.append(f'{sym} has one curated RefSeq transcript')
         else:
@@ -1056,12 +1026,13 @@ def tm_and_clamp_checks(fwd, rev, opts):
     return problems, notes
 
 
-def evaluate_gene_pair(fwd, rev, gene, opts, genome=None, isoforms=(), label=''):
+def evaluate_gene_pair(fwd, rev, gene, opts, genome=None, targets=(), label=''):
     """
     Check a fwd/rev pair against a gene's transcripts and genomic region.
-    isoforms: transcripts the pair should be specific to (empty = catch-all).
     label: an isoform named in the primer name (Mitf-M -> 'M'), which turns
-    off the catch-all check when no isoforms are given.
+    off the catch-all check.
+    targets: transcripts the pair must be specific to; used for suggested
+    alternatives, which must hit what the user's isoform pair hits.
     """
     result = blank_result(fwd, rev, gene.symbol)
     if gene.description:
@@ -1069,12 +1040,9 @@ def evaluate_gene_pair(fwd, rev, gene, opts, genome=None, isoforms=(), label='')
     notes, warnings = [], []
     if gene.note:
         notes.append(gene.note)
-    targets, unknown = resolve_isoforms(gene, isoforms)
-    if unknown:
-        warnings.append(f"Isoform {_list_accs(unknown)} isn't a RefSeq transcript of {gene.symbol}: "
-                        f"check the accession" + ('' if targets else '. Checked as catch-all instead'))
-    result['Isoforms'] = (_list_accs(targets, 99) if targets else
-                          f'{gene.symbol}-{label} (from the name)' if label else 'All (catch-all)')
+    targets = list(targets)
+    result['Isoforms'] = (f'{gene.symbol}-{label} (from the name)' if label else
+                          _list_accs(targets, 99) if targets else 'All (catch-all)')
 
     def run(seq):
         return evaluate_on_sequence(fwd.seq, rev.seq, seq, opts.max_mismatches,
@@ -1596,13 +1564,12 @@ def describe_alternative(alt):
 
 def suggest_alternatives(jobs, opts, db):
     """
-    For each (pair, gene, row, target isoforms) whose primers have a problem, gather PrimerBank and Primer3 candidates, check each one exactly
+    For each (pair, gene, row, target transcripts, isoform label) whose primers have a problem, gather PrimerBank and Primer3 candidates, check each one exactly
     as the original pairs are checked, and return the best as rows. The top
     one is also written into the pair's own row (Suggested_Alternative).
     """
     prepared = []
-    for pair, gene, row, isoforms in jobs:
-        targets = resolve_isoforms(gene, isoforms)[0]
+    for pair, gene, row, targets, label in jobs:
         seqs = dict(gene.transcripts)
         if targets:
             acc = min(targets, key=_accession_rank)
@@ -1635,7 +1602,7 @@ def suggest_alternatives(jobs, opts, db):
             if (c.fwd, c.rev) not in seen:
                 seen.add((c.fwd, c.rev))
                 candidates.append(c)
-        prepared.append((pair, gene, row, acc, template, exons, targets, candidates, bank_error))
+        prepared.append((pair, gene, row, acc, template, exons, targets, label, candidates, bank_error))
 
     # One genome scan for every candidate primer, if requested
     cand_primers, index = [], {}
@@ -1656,7 +1623,7 @@ def suggest_alternatives(jobs, opts, db):
             sites = None
 
     rows = []
-    for pair, gene, row, acc, template, exons, targets, candidates, bank_error in prepared:
+    for pair, gene, row, acc, template, exons, targets, label, candidates, bank_error in prepared:
         print(f"\n{pair.fwd.name} + {pair.rev.name}: {suggestion_reason(row)}")
         if bank_error:
             print(f'  ⚠ {bank_error}')
@@ -1669,7 +1636,7 @@ def suggest_alternatives(jobs, opts, db):
                 fi, ri = index[c.fwd], index[c.rev]
                 genome = (genome_products([fi, ri], sites, opts.max_product),
                           {fi: f.name, ri: r.name}, {fi, ri} & saturated)
-            res = evaluate_gene_pair(f, r, gene, opts, genome, targets)
+            res = evaluate_gene_pair(f, r, gene, opts, genome, targets, label)
             kind, how, product = (intron_spanning(c.fwd, c.rev, template, exons, opts)
                                   if template else (3, '', None))
             # Only offer pairs that fix the problem: genomic DNA can't give a
@@ -1822,18 +1789,16 @@ def validate(primers, opts):
                 if opts.genome_check and not genome_error:
                     genome = (genome_products([f_idx, r_idx], genome_sites, opts.max_product),
                               names, {f_idx, r_idx} & saturated)
-                # Target isoforms come from the Isoform column; a name such as
-                # Mitf-M_Fwd just says the pair isn't meant to be a catch-all
-                isoforms, label = pair.isoforms, isoform_label(fwd.base, gene)
-                row = evaluate_gene_pair(fwd, rev, gene, opts, genome, isoforms, label)
-                if label and not isoforms:
-                    # Alternatives aim for the same curated transcripts as this pair
-                    isoforms = ACCESSION_RE.findall(row['Matched_Transcripts'])
+                # A name such as Mitf-M_Fwd says the pair isn't meant to be a catch-all
+                label = isoform_label(fwd.base, gene)
+                row = evaluate_gene_pair(fwd, rev, gene, opts, genome, label=label)
+                # Alternatives for such a pair aim for the same curated transcripts
+                targets = ACCESSION_RE.findall(row['Matched_Transcripts']) if label else []
                 # Skip pairs only matched by row position with different names
                 # (e.g. promoter/enhancer genotyping primers): not a gene qPCR assay
                 same_target = pair.how != 'adjacent' or fwd.base.lower() == rev.base.lower()
                 if opts.suggest and same_target and needs_alternatives(row):
-                    suggest_jobs.append((pair, gene, row, isoforms))
+                    suggest_jobs.append((pair, gene, row, targets, label))
         # Naming problems go first: they are the thing to fix before ordering
         name_problems = [t for t in (warning, pair.note if pair.how == 'typo' else None) if t]
         if name_problems:

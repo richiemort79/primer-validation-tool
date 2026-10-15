@@ -1,5 +1,11 @@
 # Changelog
 
+## Version 2.4.2 (2026-10-15)
+
+### Isoforms
+- Removed the `Isoform` column: an isoform is now named only in the primer name (`Mitf-M_Fwd`), so upload sheets need no changes
+- The catch-all warning now suggests naming the primers `Gene-<isoform>_Fwd/_Rev` instead of adding an Isoform column
+
 ## Version 2.4.1 (2026-10-15)
 
 ### Amplicon size

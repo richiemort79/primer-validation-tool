@@ -2,7 +2,7 @@
 
 A Python script that checks PCR primers in silico before you order them or run them:
 
-- **Gene-targeted pairs** (e.g. `Mitf_Fwd` / `Mitf_Rev`) are tested against **every RefSeq transcript** of the gene and against the gene's **genomic region**, using NCBI. You get the amplicon size, which isoforms it amplifies, and whether it spans an intron (no genomic DNA product). By default a pair should amplify every curated isoform (catch-all). To target specific isoforms, add the isoform to the primer name (`Mitf-M_Fwd`) or list accessions in an **Isoform** column.
+- **Gene-targeted pairs** (e.g. `Mitf_Fwd` / `Mitf_Rev`) are tested against **every RefSeq transcript** of the gene and against the gene's **genomic region**, using NCBI. You get the amplicon size, which isoforms it amplifies, and whether it spans an intron (no genomic DNA product). By default a pair should amplify every curated isoform (catch-all). To target specific isoforms, add the isoform to the primer name with a hyphen (`Mitf-M_Fwd`).
 - **Chromosome-locus primers** (e.g. `Chr1_L_Flank`, `Chr1_R_Int`) are located on that chromosome, on both strands. Every product they can form with each other is reported, so you don't need Fwd/Rev names for genotyping primer sets.
 - **Optional genome-wide check** (`--genome-check`) searches the whole genome for off-target products, similar to UCSC In-Silico PCR.
 - **Optional suggestions** (`--suggest`): for pairs that WARN or FAIL, it proposes better pairs from Harvard PrimerBank and new Primer3 designs. Each one is checked exactly like your own primers.
@@ -74,17 +74,9 @@ Inline modification codes (`/5Phos/`, `[Btn]`), whitespace and lower case are cl
 
 By default each gene pair is checked as a **catch-all**: it should amplify every curated RefSeq transcript of the gene (NM_ and NR_), so it measures all of that gene's mRNA. A pair that misses one gets a WARN naming the missed transcripts. Predicted transcripts (XM_/XR_) are ignored, since many are never confirmed: counts such as `3/3` and the transcript lists cover curated transcripts only. (A gene with no curated transcripts is counted over all of them.)
 
-**In the primer name.** Put a hyphen and the isoform straight after the gene name: `Mitf-M_Fwd`, `MITF-M_For`. This works with Sigma/IDT upload sheets as they are. It tells the tool the pair is meant for particular isoforms, so it isn't checked as a catch-all. The tool can't know which transcripts "M" means, so it doesn't WARN about coverage. *Notes* lists the curated transcripts the pair amplifies (e.g. `amplifies 2 of 12 curated transcripts (NM_001410059.1, NM_008601.4)`) for you to confirm they're the ones you meant. With `--suggest`, alternatives aim for that same set of transcripts. Only a hyphen counts: `Tyr_Pro_For` is still a catch-all, and gene symbols that contain a hyphen (`H2-K1`) are read as the gene.
+**Targeting specific isoforms.** Put a hyphen and the isoform straight after the gene name: `Mitf-M_Fwd`, `MITF-M_For`. This works with Sigma/IDT upload sheets as they are. It tells the tool the pair is meant for particular isoforms, so it isn't checked as a catch-all. The tool can't know which transcripts "M" means, so it doesn't WARN about coverage. *Notes* lists the curated transcripts the pair amplifies (e.g. `amplifies 2 of 12 curated transcripts (NM_001410059.1, NM_008601.4)`) for you to confirm they're the ones you meant. With `--suggest`, alternatives aim for that same set of transcripts. Only a hyphen counts: `Tyr_Pro_For` is still a catch-all, and gene symbols that contain a hyphen (`H2-K1`) are read as the gene.
 
-**In an Isoform column.** To have the tool check exact transcripts, add a column whose header contains whose header contains **Isoform** (or **Transcript**) and list the RefSeq accessions there, separated by commas. The version (`.4`) is optional, and filling it in for either primer of the pair is enough:
-
-| Name | Sequence | Isoform |
-|------|----------|---------|
-| Mitf_Fwd_M | … | NM_008601.4, NM_001410059.1 |
-| Mitf_Rev_M | … | |
-| Tyr_Fwd | … | |
-
-An isoform-specific pair WARNs if it misses a target, or if it also amplifies another curated transcript. For mouse Mitf-M, the curated transcripts are NM_008601 (variant 2) and NM_001410059 (variant 12), which share the M-specific first exon. To find the accessions for another gene, look at its NCBI Gene page under *mRNA and Protein(s)*.
+For example, mouse Mitf-M is two curated transcripts, NM_008601 (variant 2) and NM_001410059 (variant 12), which share the M-specific first exon. A good `Mitf-M` pair should list exactly those two.
 
 ### Naming and pairing
 
@@ -117,10 +109,10 @@ Candidates come from two places:
 
 - **[Harvard PrimerBank](https://pga.mgh.harvard.edu/primerbank/)**: published qPCR pairs for mouse and human genes. Some were tested in the lab, and these are marked *lab-validated*.
 - **Your own primers, lengthened**: if a primer's Tm is too low, or more than 2 °C below its partner's, it is extended at the 5′ end with the bases next to its binding site, up to 28 nt. The 3′ end, which decides what gets amplified, stays the same, so it is the same assay with a higher Tm. It stops at a 5′ G or C where it can, within 3 bases of reaching the target Tm.
-- **Primer3 designs**: pairs designed around each exon junction of the transcript your primers target (for isoform-specific pairs, the first target isoform). For a catch-all, extra designs keep both primers in sequence that every curated transcript shares. For isoform-specific pairs, extra designs put one primer in sequence that only the target isoforms have, or across its edge. Either one primer crosses an exon–exon junction (so it can't prime genomic DNA), or the primers sit either side of an intron longer than `--max-product`. The design rules are typical SYBR qPCR ones: 18–25 nt, Tm 2–7 °C above `--anneal` (62–67 °C by default) within 2 °C of each other, GC 40–60%, no runs over 4 bases, and a product inside your `--min-size`/`--max-size` window, as close to 100 bp as the other rules allow. Both ends of each primer must be G or C, with no more than 3 G/C in the last 5 bases at the 3′ end (`--no-5prime-clamp` drops the 5′ rule).
+- **Primer3 designs**: pairs designed around each exon junction of the transcript your primers target (for isoform-named pairs, the first curated transcript it amplifies). For a catch-all, extra designs keep both primers in sequence that every curated transcript shares. For isoform-named pairs, extra designs put one primer in sequence that only the transcripts your pair amplifies have, or across its edge. Either one primer crosses an exon–exon junction (so it can't prime genomic DNA), or the primers sit either side of an intron longer than `--max-product`. The design rules are typical SYBR qPCR ones: 18–25 nt, Tm 2–7 °C above `--anneal` (62–67 °C by default) within 2 °C of each other, GC 40–60%, no runs over 4 bases, and a product inside your `--min-size`/`--max-size` window, as close to 100 bp as the other rules allow. Both ends of each primer must be G or C, with no more than 3 G/C in the last 5 bases at the 3′ end (`--no-5prime-clamp` drops the 5′ rule).
 
-Every candidate goes through the same checks as your primers: all transcripts, the genomic region, and the genome with `--genome-check`. Only those that **PASS with no genomic DNA product** are offered. One exception: when no candidate covers the isoforms perfectly, pairs that cover them better than yours are offered too, with the gap shown in *Problem*. An isoform-specific suggestion never amplifies another curated transcript. They're ranked by:
-1. isoform coverage: for a catch-all, the most curated transcripts (then predicted ones); for isoform-specific pairs, all the targets and nothing else;
+Every candidate goes through the same checks as your primers: all transcripts, the genomic region, and the genome with `--genome-check`. Only those that **PASS with no genomic DNA product** are offered. One exception: when no candidate covers the isoforms perfectly, pairs that cover them better than yours are offered too, with the gap shown in *Problem*. A suggestion for an isoform-named pair never amplifies a curated transcript your pair doesn't. They're ranked by:
+1. isoform coverage: for a catch-all, the most curated transcripts (then predicted ones); for isoform-named pairs, the same curated transcripts as yours and nothing else;
 2. the same product size on every isoform (one melt peak);
 3. your own primers lengthened (same assay, only a higher Tm);
 4. lab-validated PrimerBank pairs;
@@ -145,7 +137,7 @@ An Excel file with three sheets, plus an Alternatives sheet with `--suggest`. By
 |--------|-------------|
 | **Pair** | `Fwd name + Rev name` |
 | **Target** | Gene symbol and description, or chromosome |
-| **Isoforms** | `All (catch-all)`, the isoform from the name (`Mitf-M (from the name)`), or the target transcripts from the Isoform column |
+| **Isoforms** | `All (catch-all)`, or the isoform from the name (`Mitf-M (from the name)`) |
 | **Status** | PASS / WARN / FAIL / ERROR / INFERRED (see below) |
 | **Problem** | What is wrong and what to do about it. Blank for PASS; several problems are numbered |
 | **Amplicon_Size_bp** | Product size on the first amplified transcript (NM_ preferred) |
@@ -181,7 +173,7 @@ The parameters used for the run, for your records.
 ### Status meanings
 
 - **PASS**: product on the gene's transcript(s) within the size window. No mismatches, no extra products, no off-target products found.
-- **WARN**: a product forms, but something needs a look. Possible reasons: a catch-all pair missing a curated isoform, an isoform-specific pair missing a target or amplifying other isoforms, size outside the window, a mismatch, several products, product only on genomic DNA, off-target genome products, a primer Tm below `--anneal`, or primer Tms more than `--max-tm-diff` apart. A missing 3′ G/C clamp is mentioned in *Notes* but doesn't cause a WARN. The *Problem* column says what to check.
+- **WARN**: a product forms, but something needs a look. Possible reasons: a catch-all pair missing a curated isoform, size outside the window, a mismatch, several products, product only on genomic DNA, off-target genome products, a primer Tm below `--anneal`, or primer Tms more than `--max-tm-diff` apart. A missing 3′ G/C clamp is mentioned in *Notes* but doesn't cause a WARN. The *Problem* column says what to check.
 - **FAIL**: no product. *Problem* says whether one primer doesn't bind, or both bind but can't form a product.
 - **ERROR**: the gene couldn't be found or fetched, or a sequence has invalid characters.
 - **INFERRED**: a product predicted between primers that weren't named as a pair (chromosome-locus sets; also unpartnered primers with `--genome-check`).

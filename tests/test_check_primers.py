@@ -222,18 +222,6 @@ def test_load_primers_few_columns(tmp_path):
     assert [p.name for p in cp.load_primers(path)] == ['A_Fwd', 'A_Rev']
 
 
-def test_load_primers_isoform_column(tmp_path):
-    path = tmp_path / 'p.csv'
-    path.write_text('Name,Sequence,Isoform\n'
-                    'Mitf_Fwd,ACGTACGTACGT,"NM_008601.4, nm_001410059"\n'
-                    'Mitf_Rev,TTTTACGTACGT,\n'
-                    'Tyr_Fwd,ACGTACGTACGT,\n')
-    primers = cp.load_primers(path)
-    assert [p.isoforms for p in primers] == [['NM_008601.4', 'NM_001410059'], [], []]
-    pairs, _ = cp.pair_primers(primers)
-    assert pairs[0].isoforms == ['NM_008601.4', 'NM_001410059']   # either primer's cell counts
-
-
 # --- Isoforms: catch-all and isoform-specific -----------------------------------
 
 def _isoform_gene():
@@ -257,8 +245,7 @@ def test_isoform_coverage_catch_all():
 
 def test_isoform_coverage_specific():
     gene, _ = _isoform_gene()
-    targets, unknown = cp.resolve_isoforms(gene, ['NM_1', 'NM_2.5', 'NM_9'])
-    assert targets == ['NM_1.1', 'NM_2.1'] and unknown == ['NM_9']   # version ignored
+    targets = ['NM_1.1', 'NM_2.1']
     problems, notes, score, _ = cp.isoform_coverage(gene, ['NM_1.1', 'NM_2.1', 'XM_4.1'], targets)
     assert problems == [] and score == (0, 0) and notes == ['Specific to NM_1.1, NM_2.1']
     problems, _, score, _ = cp.isoform_coverage(gene, ['NM_1.1', 'NM_3.1'], targets)
@@ -293,9 +280,15 @@ def test_evaluate_gene_pair_isoforms():
     assert res['Transcripts_Amplified'] == '2/3'
     assert 'XM_4' not in res['Matched_Transcripts']
     assert any('Misses 1 of 3' in t for t in res['Problem'])
-    res = cp.evaluate_gene_pair(f, r, gene, _Opts, isoforms=['NM_1.1', 'NM_2.1'])
-    assert res['Isoforms'] == 'NM_1.1, NM_2.1'
-    assert not any('isoform' in t.lower() for t in res['Problem'])
+    # Named as an isoform: no catch-all WARN, the hits are listed
+    res = cp.evaluate_gene_pair(f, r, gene, _Opts, label='A')
+    assert res['Isoforms'] == 'Gx-A (from the name)'
+    assert not any('transcript' in t or 'isoform' in t for t in res['Problem'])
+    assert 'amplifies 2 of 3 curated transcripts (NM_1.1, NM_2.1)' in res['Notes']
+    # Alternatives are checked against the transcripts the named pair hits
+    res = cp.evaluate_gene_pair(f, r, gene, _Opts, targets=['NM_1.1', 'NM_2.1'], label='A')
+    assert 'Specific to NM_1.1, NM_2.1' in res['Notes']
+    assert not any('transcript' in t or 'isoform' in t for t in res['Problem'])
 
 
 def test_isoform_label_from_name():
@@ -313,7 +306,7 @@ def test_isoform_coverage_named_in_primer_name():
     problems, notes, score, _ = cp.isoform_coverage(gene, ['NM_1.1', 'NM_2.1', 'XM_4.1'], label='A')
     assert problems == [] and score == (0, 0)                 # no catch-all WARN
     assert 'Targets isoform Gx-A (from the name): amplifies 2 of 3 curated transcripts (NM_1.1, NM_2.1)' in notes[0]
-    # Accessions from an Isoform column still take precedence
+    # Target transcripts (for alternatives) are enforced
     problems, _, _, _ = cp.isoform_coverage(gene, ['NM_1.1'], ['NM_1.1', 'NM_2.1'], label='A')
     assert problems
 
