@@ -2,7 +2,7 @@
 
 A Python script that checks PCR primers in silico before you order them or run them:
 
-- **Gene-targeted pairs** (e.g. `Mitf_Fwd` / `Mitf_Rev`) are tested against **every RefSeq transcript** of the gene and against the gene's **genomic region**, using NCBI. You get the amplicon size, which isoforms it amplifies, and whether it spans an intron (no genomic DNA product).
+- **Gene-targeted pairs** (e.g. `Mitf_Fwd` / `Mitf_Rev`) are tested against **every RefSeq transcript** of the gene and against the gene's **genomic region**, using NCBI. You get the amplicon size, which isoforms it amplifies, and whether it spans an intron (no genomic DNA product). By default a pair should amplify every isoform (catch-all); add an **Isoform** column to target specific ones, such as Mitf-M.
 - **Chromosome-locus primers** (e.g. `Chr1_L_Flank`, `Chr1_R_Int`) are located on that chromosome, on both strands. Every product they can form with each other is reported, so you don't need Fwd/Rev names for genotyping primer sets.
 - **Optional genome-wide check** (`--genome-check`) searches the whole genome for off-target products, similar to UCSC In-Silico PCR.
 - **Optional suggestions** (`--suggest`): for pairs that WARN or FAIL, it proposes better pairs from Harvard PrimerBank and new Primer3 designs. Each one is checked exactly like your own primers.
@@ -70,6 +70,20 @@ Use an Excel order template (IDT/Sigma) or a CSV. The script finds the header ro
 
 Inline modification codes (`/5Phos/`, `[Btn]`), whitespace and lower case are cleaned up. Degenerate IUPAC bases (N, R, Y…) are supported. Any other character marks the primer as invalid.
 
+### Isoforms: catch-all or specific
+
+By default each gene pair is checked as a **catch-all**: it should amplify every curated RefSeq transcript of the gene (NM_ and NR_), so it measures all of that gene's mRNA. A pair that misses one gets a WARN naming the missed transcripts. Predicted transcripts (XM_/XR_) are only mentioned in *Notes*, since many are never confirmed.
+
+To target specific isoforms, add a column whose header contains **Isoform** (or **Transcript**) and list the RefSeq accessions there, separated by commas. The version (`.4`) is optional, and filling it in for either primer of the pair is enough:
+
+| Name | Sequence | Isoform |
+|------|----------|---------|
+| Mitf_Fwd_M | … | NM_008601.4, NM_001410059.1 |
+| Mitf_Rev_M | … | |
+| Tyr_Fwd | … | |
+
+An isoform-specific pair WARNs if it misses a target, or if it also amplifies another curated transcript. For mouse Mitf-M, the curated transcripts are NM_008601 (variant 2) and NM_001410059 (variant 12), which share the M-specific first exon. To find the accessions for another gene, look at its NCBI Gene page under *mRNA and Protein(s)*.
+
 ### Naming and pairing
 
 Each name is split into words on `_`, `-`, `.` or spaces. A direction word (`Fwd`, `For`, `Forward`, `Rev`, `Reverse`, case-insensitive, optionally numbered like `Fwd2`) can appear anywhere after the gene name. A single letter `F`/`R` only counts at the very end, so `Chr1_R_Flank` isn't read as a reverse primer.
@@ -101,16 +115,17 @@ Candidates come from two places:
 
 - **[Harvard PrimerBank](https://pga.mgh.harvard.edu/primerbank/)**: published qPCR pairs for mouse and human genes. Some were tested in the lab, and these are marked *lab-validated*.
 - **Your own primers, lengthened**: if a primer's Tm is too low, or more than 2 °C below its partner's, it is extended at the 5′ end with the bases next to its binding site, up to 28 nt. The 3′ end, which decides what gets amplified, stays the same, so it is the same assay with a higher Tm. It stops at a 5′ G or C where it can, within 3 bases of reaching the target Tm.
-- **Primer3 designs**: pairs designed around each exon junction of the transcript your primers target. Either one primer crosses an exon–exon junction (so it can't prime genomic DNA), or the primers sit either side of an intron longer than `--max-product`. The design rules are typical SYBR qPCR ones: 18–25 nt, Tm 2–7 °C above `--anneal` (62–67 °C by default) within 2 °C of each other, GC 40–60%, no runs over 4 bases, and a product inside your `--min-size`/`--max-size` window. Both ends of each primer must be G or C, with no more than 3 G/C in the last 5 bases at the 3′ end (`--no-5prime-clamp` drops the 5′ rule).
+- **Primer3 designs**: pairs designed around each exon junction of the transcript your primers target (for isoform-specific pairs, the first target isoform). For a catch-all, extra designs keep both primers in sequence that every curated transcript shares. For isoform-specific pairs, extra designs put one primer in sequence that only the target isoforms have, or across its edge. Either one primer crosses an exon–exon junction (so it can't prime genomic DNA), or the primers sit either side of an intron longer than `--max-product`. The design rules are typical SYBR qPCR ones: 18–25 nt, Tm 2–7 °C above `--anneal` (62–67 °C by default) within 2 °C of each other, GC 40–60%, no runs over 4 bases, and a product inside your `--min-size`/`--max-size` window. Both ends of each primer must be G or C, with no more than 3 G/C in the last 5 bases at the 3′ end (`--no-5prime-clamp` drops the 5′ rule).
 
-Every candidate goes through the same checks as your primers: all transcripts, the genomic region, and the genome with `--genome-check`. Only those that **PASS with no genomic DNA product** are offered. They're ranked by:
-1. your own primers lengthened (same assay, only a higher Tm);
-2. most isoforms amplified;
-3. lab-validated PrimerBank pairs;
-4. junction-crossing over intron-flanking;
-5. G/C clamps on both ends;
-6. PrimerBank over new designs;
-7. Primer3's quality score.
+Every candidate goes through the same checks as your primers: all transcripts, the genomic region, and the genome with `--genome-check`. Only those that **PASS with no genomic DNA product** are offered. One exception: when no candidate covers the isoforms perfectly, pairs that cover them better than yours are offered too, with the gap shown in *Problem*. An isoform-specific suggestion never amplifies another curated transcript. They're ranked by:
+1. isoform coverage: for a catch-all, the most curated transcripts (then predicted ones); for isoform-specific pairs, all the targets and nothing else;
+2. the same product size on every isoform (one melt peak);
+3. your own primers lengthened (same assay, only a higher Tm);
+4. lab-validated PrimerBank pairs;
+5. junction-crossing over intron-flanking;
+6. G/C clamps on both ends;
+7. PrimerBank over new designs;
+8. Primer3's quality score.
 
 A lengthened pair is only offered if it passes cleanly. If your primers don't span an intron, lengthening won't fix that, so you get the other options instead.
 
@@ -128,6 +143,7 @@ An Excel file with three sheets, plus an Alternatives sheet with `--suggest`. By
 |--------|-------------|
 | **Pair** | `Fwd name + Rev name` |
 | **Target** | Gene symbol and description, or chromosome |
+| **Isoforms** | `All (catch-all)`, or the target transcripts from the Isoform column |
 | **Status** | PASS / WARN / FAIL / ERROR / INFERRED (see below) |
 | **Problem** | What is wrong and what to do about it. Blank for PASS; several problems are numbered |
 | **Amplicon_Size_bp** | Product size on the first amplified transcript (NM_ preferred) |
@@ -147,6 +163,7 @@ An Excel file with three sheets, plus an Alternatives sheet with `--suggest`. By
 Only with `--suggest`. It has one row per suggested pair:
 - **For_Pair** and **Reason**: the pair being replaced, and why.
 - **Rank** and **Source**: PrimerBank ID (marked *lab-validated* where tested), or Primer3 design.
+- **Isoforms**: catch-all, or the target transcripts.
 - **Intron**: which junction a primer crosses, or which intron the pair spans.
 - **Amplicon size**, **transcripts amplified**, and **genome products** (with `--genome-check`).
 - **Primer sequences**, **Tm** and **GC%**.
@@ -162,7 +179,7 @@ The parameters used for the run, for your records.
 ### Status meanings
 
 - **PASS**: product on the gene's transcript(s) within the size window. No mismatches, no extra products, no off-target products found.
-- **WARN**: a product forms, but something needs a look. Possible reasons: size outside the window, a mismatch, several products, product only on genomic DNA, off-target genome products, a primer Tm below `--anneal`, or primer Tms more than `--max-tm-diff` apart. A missing 3′ G/C clamp is mentioned in *Notes* but doesn't cause a WARN. The *Problem* column says what to check.
+- **WARN**: a product forms, but something needs a look. Possible reasons: a catch-all pair missing a curated isoform, an isoform-specific pair missing a target or amplifying other isoforms, size outside the window, a mismatch, several products, product only on genomic DNA, off-target genome products, a primer Tm below `--anneal`, or primer Tms more than `--max-tm-diff` apart. A missing 3′ G/C clamp is mentioned in *Notes* but doesn't cause a WARN. The *Problem* column says what to check.
 - **FAIL**: no product. *Problem* says whether one primer doesn't bind, or both bind but can't form a product.
 - **ERROR**: the gene couldn't be found or fetched, or a sequence has invalid characters.
 - **INFERRED**: a product predicted between primers that weren't named as a pair (chromosome-locus sets; also unpartnered primers with `--genome-check`).

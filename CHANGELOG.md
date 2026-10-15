@@ -1,5 +1,17 @@
 # Changelog
 
+## Version 2.4.0 (2026-10-15)
+
+### Isoforms
+- Gene pairs are checked as catch-all by default: a pair that misses any curated (NM_/NR_) transcript now WARNs and names it. Missed predicted (XM_/XR_) transcripts are only noted
+- New optional `Isoform` (or `Transcript`) column: list RefSeq accessions to make a pair isoform-specific (e.g. Mitf-M: NM_008601, NM_001410059). It WARNs if it misses a target or amplifies another curated transcript
+- New `Isoforms` column on the Pairs and Alternatives sheets
+
+### Suggestions
+- Catch-all pairs get extra Primer3 designs with both primers in sequence shared by every curated transcript; isoform-specific pairs get designs with a primer in sequence unique to the targets
+- Ranking puts isoform coverage first, then a single product size across isoforms
+- Isoform-specific suggestions never amplify other curated transcripts
+
 ## Version 2.3.0 (2026-10-13)
 
 ### Tm

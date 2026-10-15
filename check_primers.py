@@ -80,6 +80,8 @@ DIRECTION_LETTER_RE = re.compile(r'(?P<dir>[fr])(?P<num>\d*)', re.IGNORECASE)
 # Only an exact chromosome token counts, so genes such as Chrm1, Chrna7 or
 # Chrd are still treated as genes.
 CHROM_RE = re.compile(r'^chr(?P<chrom>\d+|X|Y|M|MT)$', re.IGNORECASE)
+# RefSeq transcript accessions, version optional, in an Isoform column
+ACCESSION_RE = re.compile(r'\b[NX][MR]_\d+(?:\.\d+)?\b')
 
 # Tm conditions (Primer3 calc_tm keywords): a typical SYBR qPCR mastermix,
 # 50 mM K+, 3 mM Mg2+, 0.8 mM total dNTPs, 250 nM each primer.
@@ -326,6 +328,7 @@ class Primer:
     error: str = None
     paired_with: list = field(default_factory=list)
     binding: str = ''
+    isoforms: list = field(default_factory=list)   # target transcripts from an Isoform column
 
     @property
     def pair_key(self):
@@ -402,14 +405,22 @@ def gene_symbol_candidates(base):
 
 
 def _find_columns(raw):
-    """Locate the header row and the name/sequence columns"""
+    """Locate the header row, the name/sequence columns and an optional
+    Isoform (or Transcript) column"""
     for i in range(min(30, len(raw))):
         cells = [str(c).lower() if pd.notna(c) else '' for c in raw.iloc[i]]
         seq_col = next((j for j, c in enumerate(cells) if 'sequence' in c), None)
         name_col = next((j for j, c in enumerate(cells) if 'name' in c), None)
         if seq_col is not None and name_col is not None:
-            return i, name_col, seq_col
-    return None, 0, 2  # no header found: IDT layout, column A / column C
+            iso_col = next((j for j, c in enumerate(cells) if j not in (seq_col, name_col)
+                            and ('isoform' in c or 'transcript' in c)), None)
+            return i, name_col, seq_col, iso_col
+    return None, 0, 2, None  # no header found: IDT layout, column A / column C
+
+
+def parse_isoforms(text):
+    """RefSeq accessions in an Isoform cell: 'NM_008601.4, NM_001410059' -> list"""
+    return ACCESSION_RE.findall(str(text).upper()) if pd.notna(text) else []
 
 
 def load_primers(filepath, sheet=None):
@@ -425,7 +436,7 @@ def load_primers(filepath, sheet=None):
         raw = pd.read_excel(filepath, sheet_name=sheet if sheet is not None else 0,
                             header=None, dtype=str)
 
-    header_row, name_col, seq_col = _find_columns(raw)
+    header_row, name_col, seq_col, iso_col = _find_columns(raw)
     first_row = 0 if header_row is None else header_row + 1
 
     primers = []
@@ -440,7 +451,8 @@ def load_primers(filepath, sheet=None):
         name = str(raw_name).strip() if pd.notna(raw_name) and str(raw_name).strip() else f'Row{idx + 1}'
         base, direction, num, tag = parse_primer_name(name)
         primer = Primer(name=name, seq=seq, row=idx + 1, base=base, direction=direction,
-                        pair_num=num, tag=tag, chrom=chromosome_of(base))
+                        pair_num=num, tag=tag, chrom=chromosome_of(base),
+                        isoforms=parse_isoforms(raw.iat[idx, iso_col]) if iso_col is not None else [])
         bad = invalid_bases(seq)
         if bad:
             primer.error = f"Invalid characters in sequence: {''.join(bad)}"
@@ -457,6 +469,11 @@ class PrimerPair:
     rev: Primer
     how: str = 'name'   # 'name', 'adjacent' (neighbouring rows) or 'typo'
     note: str = ''
+
+    @property
+    def isoforms(self):
+        """Target transcripts given for either primer; empty means all (catch-all)"""
+        return list(dict.fromkeys(self.fwd.isoforms + self.rev.isoforms))
 
 
 def pair_primers(primers):
@@ -608,6 +625,72 @@ class GeneRecord:
 def _accession_rank(acc):
     order = {'NM': 0, 'NR': 1, 'XM': 2, 'XR': 3}
     return (order.get(acc[:2], 4), acc)
+
+
+def unversioned(acc):
+    return acc.split('.')[0]
+
+
+def curated_transcripts(gene):
+    """The gene's curated RefSeq transcripts (NM_/NR_); all of them if it has none"""
+    accs = [acc for acc, _ in gene.transcripts]
+    return [a for a in accs if a[:2] in ('NM', 'NR')] or accs
+
+
+def resolve_isoforms(gene, isoforms):
+    """Match Isoform-column accessions (version optional) to the gene's
+    transcripts. Returns (matched accessions, accessions not found)."""
+    by_base = {unversioned(acc): acc for acc, _ in gene.transcripts}
+    found, missing = [], []
+    for a in isoforms:
+        acc = by_base.get(unversioned(a))
+        (found if acc else missing).append(acc or a)
+    return list(dict.fromkeys(found)), missing
+
+
+def _list_accs(accs, limit=6):
+    return ', '.join(accs[:limit]) + (f' and {len(accs) - limit} more' if len(accs) > limit else '')
+
+
+def isoform_coverage(gene, amplified, targets=None):
+    """
+    Which transcripts a pair should amplify, and how well it does.
+    Catch-all (no targets): every curated (NM_/NR_) transcript, so a pair
+    measures all of the gene's mRNA; predicted XM_/XR_ ones are only noted.
+    Isoform-specific: all the targets and no other curated transcript.
+    Returns (problems, notes, problem score, rank score); lower scores are
+    better and (0, 0) means no problem.
+    """
+    amplified = set(amplified)
+    curated = set(curated_transcripts(gene))
+    others = [acc for acc, _ in gene.transcripts if acc not in amplified]
+    sym, problems, notes = gene.symbol, [], []
+    if not targets:
+        missed = [acc for acc, _ in gene.transcripts if acc in curated and acc not in amplified]
+        if missed:
+            problems.append(f"Misses {len(missed)} of {len(curated)} curated {sym} transcripts "
+                            f"({_list_accs(missed)}): won't measure all {sym} mRNA. If you want "
+                            f"specific isoforms, list them in an Isoform column")
+        elif len(gene.transcripts) == 1:
+            notes.append(f'{sym} has one RefSeq transcript')
+        elif not others:
+            notes.append(f'Amplifies all {len(gene.transcripts)} {sym} transcripts')
+        else:
+            notes.append(f'Amplifies all {len(curated)} curated {sym} transcripts; misses predicted '
+                         f'{_list_accs(others)}')
+        return problems, notes, (len(missed), 0), (len(missed), len(others))
+    missed = [t for t in targets if t not in amplified]
+    extra = [acc for acc, _ in gene.transcripts if acc in amplified and acc not in targets]
+    extra_curated = [acc for acc in extra if acc in curated]
+    if missed:
+        problems.append(f"Doesn't amplify target isoform{'s' if len(missed) > 1 else ''} {_list_accs(missed)}")
+    if extra_curated:
+        problems.append(f'Not isoform-specific: also amplifies {_list_accs(extra_curated)}')
+    if not missed and not extra_curated:
+        notes.append(f"Specific to {_list_accs(targets)}"
+                     + (f' (also predicted {_list_accs(extra)})' if extra else ''))
+    return (problems, notes, (len(missed), len(extra_curated)),
+            (len(missed), len(extra_curated), len(extra)))
 
 
 def fetch_gene(ncbi, symbol, organism, flank=1000, cache_dir=None, refresh=False):
@@ -903,6 +986,7 @@ def blank_result(fwd, rev, target):
     return {
         'Pair': f'{fwd.name} + {rev.name}',
         'Target': target,
+        'Isoforms': '',         # gene pairs: target transcripts, or 'All (catch-all)'
         'Status': 'FAIL',
         'Problem': [],          # list while evaluating; joined by format_problems for output
         'Amplicon_Size_bp': None,
@@ -954,14 +1038,22 @@ def tm_and_clamp_checks(fwd, rev, opts):
     return problems, notes
 
 
-def evaluate_gene_pair(fwd, rev, gene, opts, genome=None):
-    """Check a fwd/rev pair against a gene's transcripts and genomic region"""
+def evaluate_gene_pair(fwd, rev, gene, opts, genome=None, isoforms=()):
+    """
+    Check a fwd/rev pair against a gene's transcripts and genomic region.
+    isoforms: transcripts the pair should be specific to (empty = catch-all).
+    """
     result = blank_result(fwd, rev, gene.symbol)
     if gene.description:
         result['Target'] = f'{gene.symbol} ({gene.description})'
     notes, warnings = [], []
     if gene.note:
         notes.append(gene.note)
+    targets, unknown = resolve_isoforms(gene, isoforms)
+    if unknown:
+        warnings.append(f"Isoform {_list_accs(unknown)} isn't a RefSeq transcript of {gene.symbol}: "
+                        f"check the accession" + ('' if targets else '. Checked as catch-all instead'))
+    result['Isoforms'] = _list_accs(targets, 99) if targets else 'All (catch-all)'
 
     def run(seq):
         return evaluate_on_sequence(fwd.seq, rev.seq, seq, opts.max_mismatches,
@@ -1002,12 +1094,14 @@ def evaluate_gene_pair(fwd, rev, gene, opts, genome=None):
         if product.left.primer == 'R':
             notes.append('Fwd/Rev names are swapped relative to the transcript (works the same)')
         sizes = {p.products[0].size for _, p in amplified}
+        result['_sizes'] = len(sizes)
         if len(sizes) > 1:
             notes.append(f"Product size differs between isoforms ({', '.join(map(str, sorted(sizes)))} bp)")
-        notes.append(f'Amplifies all {len(tx_results)} {gene.symbol} transcripts'
-                     if len(amplified) == len(tx_results) and len(tx_results) > 1 else
-                     f'Amplifies {len(amplified)} of {len(tx_results)} {gene.symbol} transcripts'
-                     if len(tx_results) > 1 else f'{gene.symbol} has one RefSeq transcript')
+        cov_problems, cov_notes, result['_coverage'], result['_coverage_rank'] = isoform_coverage(
+            gene, [acc for acc, _ in amplified], targets)
+        warnings.extend(cov_problems)
+        notes.extend(cov_notes)
+        result['_coverage_problems'] = len(cov_problems)
         if gen is not None:
             if gen.products:
                 notes.append(f'Does not span an intron: genomic DNA also gives a {gen.products[0].size} bp '
@@ -1290,12 +1384,54 @@ def fetch_primerbank(symbol, organism, cache_dir=None, refresh=False):
     return candidates, None
 
 
-def design_primer3(template, junctions, opts, per_junction=3, per_intron=2):
+def shared_mask(template, others, k=20):
+    """
+    Per template position: True if it lies in a k-mer that every one of the
+    other transcripts also contains (so it is sequence they share).
+    """
+    mask = [True] * len(template) if not others else [False] * len(template)
+    if not others:
+        return mask
+    kmer_sets = [{seq[i:i + k] for i in range(len(seq) - k + 1)} for seq in others]
+    for i in range(len(template) - k + 1):
+        kmer = template[i:i + k]
+        if all(kmer in ks for ks in kmer_sets):
+            mask[i:i + k] = [True] * k
+    return mask
+
+
+def mask_regions(mask, value):
+    """[start, length] runs where mask == value"""
+    regions, start = [], None
+    for i, m in enumerate(list(mask) + [not value]):
+        if m == value and start is None:
+            start = i
+        elif m != value and start is not None:
+            regions.append([start, i - start])
+            start = None
+    return regions
+
+
+def unique_regions(template, others, k=20):
+    """[start, length] runs of the template found in none of the other
+    transcripts: where a primer must sit to tell the isoforms apart"""
+    covered = [False] * len(template)
+    for seq in others:
+        m = shared_mask(template, [seq], k)
+        covered = [a or b for a, b in zip(covered, m)]
+    return mask_regions(covered, False)
+
+
+def design_primer3(template, junctions, opts, per_junction=3, per_intron=2, excluded=(), unique=()):
     """
     Design qPCR pairs on a transcript with Primer3, around every exon
     junction separately (so the options are spread along the transcript),
     two ways: a primer crossing the junction (cannot prime genomic DNA), and
     primers either side of the intron.
+    excluded: [start, length] regions no primer may use (catch-all designs
+    keep primers out of sequence some isoforms lack).
+    unique: [start, length] regions only the target isoforms have; extra
+    designs put a primer inside each one, or across its edges.
     """
     if primer3 is None:
         return []
@@ -1306,6 +1442,16 @@ def design_primer3(template, junctions, opts, per_junction=3, per_intron=2):
         # Flanking only helps if the genomic product would be too long to amplify
         if intron + opts.min_size > opts.max_product:
             runs.append(({'SEQUENCE_TARGET': [max(j - 1, 0), 2]}, per_intron))
+    for start, length in unique:
+        for edge in (start, start + length):
+            if 0 < edge < len(template):
+                runs.append(({'SEQUENCE_OVERLAP_JUNCTION_LIST': [edge]}, per_junction))
+        if length >= settings['PRIMER_MIN_SIZE']:
+            runs.append(({'SEQUENCE_PRIMER_PAIR_OK_REGION_LIST': [[start, length, -1, -1]]}, per_junction))
+            runs.append(({'SEQUENCE_PRIMER_PAIR_OK_REGION_LIST': [[-1, -1, start, length]]}, per_junction))
+    if excluded:
+        runs = [(dict(extra, SEQUENCE_EXCLUDED_REGION=[list(r) for r in excluded]), n)
+                for extra, n in runs]
     candidates = []
     for extra, n in runs:
         try:
@@ -1427,20 +1573,40 @@ def suggest_alternatives(jobs, opts, db):
     """
     prepared = []
     for pair, gene, row in jobs:
-        acc = (row['Matched_Transcripts'].split(' ')[0] if row['Matched_Transcripts']
-               else next((a for a, _ in gene.transcripts if a.startswith('NM_')),
-                         gene.transcripts[0][0] if gene.transcripts else None))
-        template = dict(gene.transcripts).get(acc)
+        targets = resolve_isoforms(gene, pair.isoforms)[0]
+        seqs = dict(gene.transcripts)
+        if targets:
+            acc = min(targets, key=_accession_rank)
+        else:
+            acc = (row['Matched_Transcripts'].split(' ')[0] if row['Matched_Transcripts']
+                   else next((a for a, _ in gene.transcripts if a.startswith('NM_')),
+                             gene.transcripts[0][0] if gene.transcripts else None))
+        template = seqs.get(acc)
         exons = map_exons(template, gene.genomic) if template and gene.genomic else []
         bank, bank_error = fetch_primerbank(gene.symbol, opts.organism, opts.cache_dir, opts.refresh)
-        designed = design_primer3(template, exon_junctions(exons), opts) if template else []
+        designed = []
+        if template:
+            junctions = exon_junctions(exons)
+            if targets:
+                # Isoform-specific: a primer in sequence the other curated transcripts lack
+                others = [seqs[a] for a in curated_transcripts(gene) if a not in targets]
+                designed = design_primer3(template, junctions, opts,
+                                          unique=unique_regions(template, others) if others else ())
+            else:
+                # Catch-all: primers only in sequence every curated transcript shares,
+                # plus unrestricted designs in case they share too little
+                others = [seqs[a] for a in curated_transcripts(gene) if a != acc]
+                excluded = mask_regions(shared_mask(template, others), False)
+                if excluded:
+                    designed = design_primer3(template, junctions, opts, excluded=excluded)
+                designed += design_primer3(template, junctions, opts)
         lengthened = lengthen_pair(pair.fwd.seq, pair.rev.seq, template, opts) if template else None
         seen, candidates = {(pair.fwd.seq, pair.rev.seq)}, []
         for c in ([lengthened] if lengthened else []) + bank + designed:
             if (c.fwd, c.rev) not in seen:
                 seen.add((c.fwd, c.rev))
                 candidates.append(c)
-        prepared.append((pair, gene, row, acc, template, exons, candidates, bank_error))
+        prepared.append((pair, gene, row, acc, template, exons, targets, candidates, bank_error))
 
     # One genome scan for every candidate primer, if requested
     cand_primers, index = [], {}
@@ -1461,7 +1627,7 @@ def suggest_alternatives(jobs, opts, db):
             sites = None
 
     rows = []
-    for pair, gene, row, acc, template, exons, candidates, bank_error in prepared:
+    for pair, gene, row, acc, template, exons, targets, candidates, bank_error in prepared:
         print(f"\n{pair.fwd.name} + {pair.rev.name}: {suggestion_reason(row)}")
         if bank_error:
             print(f'  ⚠ {bank_error}')
@@ -1474,22 +1640,30 @@ def suggest_alternatives(jobs, opts, db):
                 fi, ri = index[c.fwd], index[c.rev]
                 genome = (genome_products([fi, ri], sites, opts.max_product),
                           {fi: f.name, ri: r.name}, {fi, ri} & saturated)
-            res = evaluate_gene_pair(f, r, gene, opts, genome)
+            res = evaluate_gene_pair(f, r, gene, opts, genome, targets)
             kind, how, product = (intron_spanning(c.fwd, c.rev, template, exons, opts)
                                   if template else (3, '', None))
-            # Only offer pairs that fix the problem: no warnings at all, and
-            # genomic DNA can't give a product
-            if res['Status'] != 'PASS' or kind >= 2 or pd.notna(res['Genomic_Amplicon_bp']):
+            # Only offer pairs that fix the problem: genomic DNA can't give a
+            # product, and no warnings except isoform coverage that is still
+            # better than your pair's (e.g. no pair reaches every isoform).
+            # An isoform-specific pair must never amplify another curated isoform
+            coverage_only = (res['Status'] in ('PASS', 'WARN') and '_coverage' in res
+                             and len(res['Problem']) == res['_coverage_problems']
+                             and not (targets and res['_coverage'][1]))
+            if (not coverage_only or kind >= 2 or pd.notna(res['Genomic_Amplicon_bp'])
+                    or (res['_coverage_problems']
+                        and res['_coverage'] >= row.get('_coverage', (float('inf'),) * 2))):
                 continue
-            amplified, total = (int(x) for x in res['Transcripts_Amplified'].split('/'))
             clamped = all(has_clamp(seq, end) for seq in (c.fwd, c.rev)
                           for end in ((5, 3) if opts.clamp_5prime else (3,)))
-            # Your own primers lengthened first (same assay, just a higher
-            # Tm), then most isoforms covered, lab-validated PrimerBank pairs,
+            # Best isoform coverage first (catch-all: every curated transcript;
+            # isoform-specific: the targets and nothing else), then one product
+            # size on every isoform, your own primers lengthened (same assay,
+            # just a higher Tm), lab-validated PrimerBank pairs,
             # junction-crossing over intron-flanking, G/C clamps, PrimerBank
             # over new designs, lower Primer3 penalty
-            key = (c.source != 'Lengthened', -(amplified / total if total else 0), not c.validated,
-                   kind, not clamped, c.source != 'PrimerBank', c.penalty)
+            key = (res['_coverage_rank'], res.get('_sizes', 1) > 1, c.source != 'Lengthened',
+                   not c.validated, kind, not clamped, c.source != 'PrimerBank', c.penalty)
             scored.append((key, c, res, how, product))
         scored.sort(key=lambda x: x[0])
 
@@ -1520,6 +1694,7 @@ def suggest_alternatives(jobs, opts, db):
                 'Reason': suggestion_reason(row),
                 'Rank': rank,
                 'Source': c.label,
+                'Isoforms': res['Isoforms'],
                 'Status': res['Status'],
                 'Problem': format_problems(res['Problem']),
                 'Intron': how,
@@ -1618,7 +1793,7 @@ def validate(primers, opts):
                 if opts.genome_check and not genome_error:
                     genome = (genome_products([f_idx, r_idx], genome_sites, opts.max_product),
                               names, {f_idx, r_idx} & saturated)
-                row = evaluate_gene_pair(fwd, rev, gene, opts, genome)
+                row = evaluate_gene_pair(fwd, rev, gene, opts, genome, pair.isoforms)
                 # Skip pairs only matched by row position with different names
                 # (e.g. promoter/enhancer genotyping primers): not a gene qPCR assay
                 same_target = pair.how != 'adjacent' or fwd.base.lower() == rev.base.lower()

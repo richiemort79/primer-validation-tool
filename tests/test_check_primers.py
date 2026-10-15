@@ -222,6 +222,79 @@ def test_load_primers_few_columns(tmp_path):
     assert [p.name for p in cp.load_primers(path)] == ['A_Fwd', 'A_Rev']
 
 
+def test_load_primers_isoform_column(tmp_path):
+    path = tmp_path / 'p.csv'
+    path.write_text('Name,Sequence,Isoform\n'
+                    'Mitf_Fwd,ACGTACGTACGT,"NM_008601.4, nm_001410059"\n'
+                    'Mitf_Rev,TTTTACGTACGT,\n'
+                    'Tyr_Fwd,ACGTACGTACGT,\n')
+    primers = cp.load_primers(path)
+    assert [p.isoforms for p in primers] == [['NM_008601.4', 'NM_001410059'], [], []]
+    pairs, _ = cp.pair_primers(primers)
+    assert pairs[0].isoforms == ['NM_008601.4', 'NM_001410059']   # either primer's cell counts
+
+
+# --- Isoforms: catch-all and isoform-specific -----------------------------------
+
+def _isoform_gene():
+    """Synthetic gene: exon A or B, then shared exons C and D. Two curated
+    transcripts use exon A (NM_1, NM_2), one exon B (NM_3); XM_4 skips exon C."""
+    a, b, c, d = (_random_seq(n, seed) for n, seed in ((150, 21), (150, 22), (200, 23), (200, 24)))
+    tx = [('NM_1.1', a + c + d), ('NM_2.1', a + c + d + 'ACGT'), ('NM_3.1', b + c + d),
+          ('XM_4.1', a + d)]
+    gene = cp.GeneRecord('Gx', '1', '', '', None, None, None, tx, None, 1000)
+    return gene, (a, b, c, d)
+
+
+def test_isoform_coverage_catch_all():
+    gene, _ = _isoform_gene()
+    problems, notes, score, _ = cp.isoform_coverage(gene, ['NM_1.1', 'NM_2.1', 'NM_3.1'])
+    assert problems == [] and score == (0, 0)
+    assert 'misses predicted XM_4.1' in notes[0]               # predicted ones only noted
+    problems, _, score, _ = cp.isoform_coverage(gene, ['NM_1.1', 'NM_2.1'])
+    assert score == (1, 0) and 'Misses 1 of 3 curated Gx transcripts (NM_3.1)' in problems[0]
+
+
+def test_isoform_coverage_specific():
+    gene, _ = _isoform_gene()
+    targets, unknown = cp.resolve_isoforms(gene, ['NM_1', 'NM_2.5', 'NM_9'])
+    assert targets == ['NM_1.1', 'NM_2.1'] and unknown == ['NM_9']   # version ignored
+    problems, notes, score, _ = cp.isoform_coverage(gene, ['NM_1.1', 'NM_2.1', 'XM_4.1'], targets)
+    assert problems == [] and score == (0, 0) and 'also predicted XM_4.1' in notes[0]
+    problems, _, score, _ = cp.isoform_coverage(gene, ['NM_1.1', 'NM_3.1'], targets)
+    assert score == (1, 1)
+    assert "Doesn't amplify target isoform NM_2.1" in problems[0]
+    assert 'also amplifies NM_3.1' in problems[1]
+
+
+def test_shared_and_unique_regions():
+    gene, (a, b, c, d) = _isoform_gene()
+    seqs = dict(gene.transcripts)
+    template = seqs['NM_1.1']
+    # Catch-all: only exons C and D are in every curated transcript
+    excluded = cp.mask_regions(cp.shared_mask(template, [seqs['NM_2.1'], seqs['NM_3.1']]), False)
+    # (the boundary can move a few bases where exons A and B happen to end alike)
+    [[start, length]] = excluded
+    assert start == 0 and len(a) - 5 <= length <= len(a)
+    # NM_1 vs NM_3: exon A is what tells them apart
+    [[start, length]] = cp.unique_regions(template, [seqs['NM_3.1']])
+    assert start == 0 and len(a) - 5 <= length <= len(a)
+
+
+def test_evaluate_gene_pair_isoforms():
+    gene, (a, b, c, d) = _isoform_gene()
+    f = cp.Primer('Gx_Fwd', a[100:120], 0)                    # exon A: NM_1, NM_2, XM_4
+    r = cp.Primer('Gx_Rev', cp.reverse_complement(d[20:40]), 0)
+    for p in (f, r):
+        p.stats = cp.calculate_primer_stats(p.seq)
+    res = cp.evaluate_gene_pair(f, r, gene, _Opts)
+    assert res['Isoforms'] == 'All (catch-all)' and res['Status'] == 'WARN'
+    assert any('Misses 1 of 3' in t for t in res['Problem'])
+    res = cp.evaluate_gene_pair(f, r, gene, _Opts, isoforms=['NM_1.1', 'NM_2.1'])
+    assert res['Isoforms'] == 'NM_1.1, NM_2.1'
+    assert not any('isoform' in t.lower() for t in res['Problem'])
+
+
 # --- Alternative primers (--suggest) -------------------------------------------
 
 def _gene_model(seed=7):
