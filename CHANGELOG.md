@@ -1,5 +1,11 @@
 # Changelog
 
+## Version 2.4.1 (2026-10-15)
+
+### Amplicon size
+- Default size window widened from 70-150 to 70-175 bp (`--max-size`): products up to ~200 bp amplify efficiently with standard SYBR cycling
+- New Primer3 designs still aim for ~100 bp: each bp over that adds to the design penalty
+
 ## Version 2.4.0 (2026-10-15)
 
 ### Isoforms

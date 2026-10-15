@@ -1294,6 +1294,10 @@ PRIMER3_SETTINGS = {
     # A junction-spanning primer needs at least this much on each side
     'PRIMER_MIN_3_PRIME_OVERLAP_OF_JUNCTION': 4,
     'PRIMER_MIN_5_PRIME_OVERLAP_OF_JUNCTION': 7,
+    # New designs aim short (~100 bp) even though products up to --max-size
+    # pass: each bp over the optimum adds to the pair's penalty
+    'PRIMER_PRODUCT_OPT_SIZE': 100,
+    'PRIMER_PAIR_WT_PRODUCT_SIZE_GT': 0.05,
 }
 
 
@@ -2032,7 +2036,7 @@ Environment:
     parser.add_argument('--sheet', help='Worksheet name (default: first sheet)')
     parser.add_argument('--organism', default='Mus musculus', help='Organism (default: Mus musculus)')
     parser.add_argument('--min-size', type=int, default=70, help='Minimum target amplicon size (default 70)')
-    parser.add_argument('--max-size', type=int, default=150, help='Maximum target amplicon size (default 150)')
+    parser.add_argument('--max-size', type=int, default=175, help='Maximum target amplicon size (default 175)')
     parser.add_argument('--max-product', type=int, default=4000,
                         help='Largest product considered amplifiable, for gDNA/off-target/locus '
                              'products (default 4000)')
